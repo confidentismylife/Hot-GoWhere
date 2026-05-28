@@ -132,6 +132,16 @@ class NLConverter:
             content = content[:50] + "..."
         return f"[最近消息] {content}"
 
+    @staticmethod
+    def vlm_context(description: str) -> str:
+        """v2.0: 将VLM输出格式化为Prompt段落."""
+        if not description:
+            return ""
+        return f"""
+[监控画面分析]
+{description}
+"""
+
     @classmethod
     def full_context(cls, agent: Agent, env: EnvironmentSnapshot) -> str:
         """Assemble complete NL context for one agent's LLM decision call."""

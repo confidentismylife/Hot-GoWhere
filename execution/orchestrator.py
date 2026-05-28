@@ -212,14 +212,40 @@ class SimulationOrchestrator:
 
     def run(self):
         """Execute the full simulation."""
+        # v2.0 feature flags
+        self.use_vlm = self.cfg.get("vlm", {}).get("enabled", False)
+        self.use_diffusion = self.cfg.get("diffusion", {}).get("enabled", False)
+
         print("\n" + "=" * 60)
-        print("   LLM-Powered Crowd Evacuation Simulation")
-        print("   Single GPU (4090 24GB) Edition")
+        if self.use_vlm or self.use_diffusion:
+            print("   LLM Evacuation Simulation — v2.0 BETA")
+            print(f"   VLM: {'ON' if self.use_vlm else 'OFF'}  "
+                  f"Trajectory: {'DIFFUSION' if self.use_diffusion else 'SOCIAL FORCE'}")
+        else:
+            print("   LLM-Powered Crowd Evacuation Simulation")
+            print("   Single GPU (4090 24GB) Edition")
         print("=" * 60 + "\n")
 
         # Initialize
         self.generate_agents()
         self.llm_engine.initialize()
+
+        # v2: VLM 感知器
+        self.vlm = None
+        if self.use_vlm:
+            from perception.vlm_perceiver import VLMPerceiver
+            self.vlm = VLMPerceiver(
+                model_name=self.cfg["vlm"].get("model", "Qwen/Qwen2.5-VL-7B-Instruct-AWQ"),
+                call_interval=self.cfg["vlm"].get("call_interval", 30),
+            )
+            self.vlm.initialize()
+
+        # v2: 扩散模型轨迹生成
+        self.diffusion_policy = None
+        if self.use_diffusion:
+            from execution.diffusion_policy import DiffusionPolicy
+            self.diffusion_policy = DiffusionPolicy(self.cfg)
+            self.diffusion_policy.initialize()
 
         total_ticks = int(self.duration / self.dt)
         vis = None
@@ -279,6 +305,12 @@ class SimulationOrchestrator:
                 self.total_llm_time += sum(d.compute_time for d in decisions.values())
                 self._apply_decisions(decisions)
 
+            # ---- 3.5 VLM Perception (v2.0) ----
+            vlm_description = ""
+            if self.vlm is not None and self.tick % self.vlm.call_interval == 0:
+                frame = self._render_cctv_frame()  # 渲染当前场景为RGB
+                vlm_description = self.vlm.perceive(frame, self.tick, env_snapshot)
+
             # ---- 4. Group Intelligence ----
             self.group_intel.propagate(
                 self.agents,
@@ -286,8 +318,11 @@ class SimulationOrchestrator:
             self.group_intel.update_fear_levels(self.agents, env_snapshot, self.dt)
             self.group_intel.update_stamina(self.agents, self.dt)
 
-            # ---- 5. Physics (batched — all agents in one JIT call) ----
-            self.physics.step_all(self.agents, self.dt)
+            # ---- 5. Physics ----
+            if self.use_diffusion and self.diffusion_policy is not None:
+                self._step_diffusion(env_snapshot)
+            else:
+                self.physics.step_all(self.agents, self.dt)
 
             # ---- 6. Stats update ----
             self.evacuated_count = sum(
@@ -365,6 +400,104 @@ class SimulationOrchestrator:
         if 60 < self.sim_time < 61:
             return "消防人员已到达,请保持冷静,听从指挥。"
         return ""
+
+    # ================================================================
+    # v2.0: 扩散模型轨迹播放
+    # ================================================================
+
+    def _step_diffusion(self, env_snapshot):
+        """v2.0: 播放预生成的扩散轨迹, 需要时重新生成."""
+        from execution.diffusion_policy import build_scene_map
+
+        for agent in self.agents:
+            if agent.dynamic.evacuated or not agent.dynamic.alive:
+                continue
+
+            # 判断是否需要重新生成轨迹
+            needs_new = (
+                agent.dynamic.future_trajectory is None or
+                agent.dynamic.traj_step >= len(agent.dynamic.future_trajectory) or
+                agent.dynamic.has_new_info
+            )
+
+            if needs_new:
+                if agent.dynamic.target_exit is not None:
+                    scene = build_scene_map(
+                        agent.position, env_snapshot, resolution=64
+                    )
+                    traj = self.diffusion_policy.generate_one(
+                        start=agent.position,
+                        target=agent.dynamic.target_exit,
+                        llm_reasoning=agent.dynamic.reasoning_text or "",
+                        scene_map=scene,
+                        num_steps=31,
+                    )
+                    agent.dynamic.future_trajectory = traj
+                    agent.dynamic.traj_step = 0
+                else:
+                    # 还没有LLM决策 — 原地不动
+                    agent.dynamic.future_trajectory = None
+                    continue
+
+            # 播放当前帧
+            traj = agent.dynamic.future_trajectory
+            if traj is not None and agent.dynamic.traj_step < len(traj):
+                idx = agent.dynamic.traj_step
+                new_pos = traj[idx]
+                agent.dynamic.velocity = new_pos - agent.dynamic.position
+                agent.dynamic.position = new_pos
+                agent.dynamic.traj_step += 1
+
+                # 出口检查
+                if agent.dynamic.target_exit is not None:
+                    dist = np.linalg.norm(new_pos - agent.dynamic.target_exit)
+                    if dist < 1.5:
+                        agent.dynamic.evacuated = True
+
+    def _render_cctv_frame(self) -> np.ndarray:
+        """渲染当前场景为RGB图像 (模拟CCTV画面). 用于VLM输入."""
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(6.4, 4.8), dpi=100)
+        ax.set_xlim(0, self.width)
+        ax.set_ylim(0, self.height)
+        ax.set_facecolor('#1a1a2e')
+
+        # 烟雾
+        snap = self.disaster.snapshot(
+            self.tick, self.sim_time, self.exits, self.obstacles
+        )
+        for r in range(0, snap.grid.shape[0], 4):
+            for c in range(0, snap.grid.shape[1], 4):
+                s = snap.grid[r, c, 0]
+                if s > 0.05:
+                    rect = plt.Rectangle(
+                        (c * snap.grid_resolution, r * snap.grid_resolution),
+                        snap.grid_resolution * 4, snap.grid_resolution * 4,
+                        facecolor='gray', alpha=min(0.6, s * 0.7), edgecolor='none'
+                    )
+                    ax.add_patch(rect)
+
+        # Agent位置
+        active = [a for a in self.agents
+                  if a.dynamic.alive and not a.dynamic.evacuated]
+        if active:
+            pos = np.array([a.position for a in active])
+            ax.scatter(pos[:, 0], pos[:, 1], c='cyan', s=3, alpha=0.8)
+
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+        fig.canvas.draw()
+        frame = np.array(fig.canvas.renderer.buffer_rgba())[:, :, :3]
+        plt.close(fig)
+        return frame
+
+    # ================================================================
+    # Summary
+    # ================================================================
 
     def _print_summary(self, tick_times: List[float]):
         print("\n" + "=" * 60)

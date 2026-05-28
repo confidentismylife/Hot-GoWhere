@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Any
 import uuid
 import numpy as np
 
@@ -77,6 +77,11 @@ class AgentDynamic:
     # --- Decision bookkeeping ---
     last_decision_tick: int = -999
     has_new_info: bool = True       # Forces re-decision
+
+    # --- v2.0: 扩散模型预生成轨迹 ---
+    future_trajectory: Optional[Any] = None   # np.ndarray [N,2] 预生成轨迹
+    traj_step: int = 0                       # 当前播放到第几步
+    traj_generation_tick: int = -999          # 轨迹生成时的tick
 
 
 @dataclass

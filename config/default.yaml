@@ -59,3 +59,24 @@ visualization:
   width: 1200
   height: 720
   fps: 30
+
+# ================================================================
+# v2.0 实验性功能 (开发中)
+# ================================================================
+# 开启方式: python main.py --config config/default.yaml
+# 或在配置中设 enabled: true
+
+vlm:
+  enabled: false
+  model: "Qwen/Qwen2.5-VL-7B-Instruct-AWQ"   # 开发: AWQ, 实验: FP16
+  call_interval: 30                            # 每N tick调用一次
+
+diffusion:
+  enabled: false
+  d_model: 256
+  nhead: 8
+  num_layers: 6
+  num_inference_steps: 100
+  checkpoint: "./checkpoints/diffusion_final.pt"
+
+trajectory_mode: "social_force"  # "social_force" | "diffusion"

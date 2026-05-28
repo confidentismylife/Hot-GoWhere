@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.vllm/
+data/
+frames/
+*.mp4
+*.gif
+.DS_Store
+*.egg-info/
+dist/
+build/

@@ -1,6 +1,43 @@
 # 当AI学会逃生：基于LLM的智能体人群疏散仿真系统
 
-## —— 从零到一的完整设计与实现
+> LLM-Powered Crowd Evacuation Simulation — Single GPU (4090 24GB) Edition
+
+[![GPU](https://img.shields.io/badge/GPU-RTX%204090%2024GB-green)]()
+[![Python](https://img.shields.io/badge/Python-3.11%2B-blue)]()
+[![vLLM](https://img.shields.io/badge/Inference-vLLM-orange)]()
+
+---
+
+## 快速开始
+
+```bash
+# 1. 环境
+pip install vllm numba numpy pyyaml pygame matplotlib imageio
+export HF_ENDPOINT=https://hf-mirror.com
+
+# 2. 验证物理引擎 (无需GPU)
+python tests/test_physics_only.py
+
+# 3. 正式运行
+python main.py --no-viz -n 500             # 纯计算模式
+python main.py --record -n 500             # 录帧，存PNG到frames/
+```
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `-n / --agents` | 800 | Agent数量 (4090: 500~2000, H800: 5000+) |
+| `--no-viz` | — | 无渲染 (最快) |
+| `--record` | — | 无头录帧，存PNG |
+| `--frame-interval` | 10 | 每N tick存一帧 |
+| `--config` | config/default.yaml | 自定义配置文件 |
+
+**实测性能 (RTX 4090):**
+
+| Agent | 物理 tick | 含LLM推理平均tick |
+|-------|:---:|:---:|
+| 500 | ~5ms | ~70ms |
+| 1000 | ~8ms | ~120ms |
+| 5000 | ~31ms | — |
 
 ---
 

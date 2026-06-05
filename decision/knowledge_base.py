@@ -121,8 +121,11 @@ class DisasterKnowledgeBase:
 
     def _keyword_search(self, query: str, disaster_type: str,
                         top_k: int) -> List[str]:
-        """Simple keyword overlap scoring for fallback."""
-        query_words = set(query)
+        """Bigram overlap scoring for fallback (works for Chinese + mixed text)."""
+        def _bigrams(s: str) -> set:
+            return {s[i:i+2] for i in range(len(s) - 1)}
+
+        query_bigrams = _bigrams(query)
 
         # Gather candidates: from specific type + general
         candidates = []
@@ -133,11 +136,12 @@ class DisasterKnowledgeBase:
         if not candidates:
             return CORE_KNOWLEDGE["general"][:top_k]
 
-        # Score by word overlap
+        # Score by bigram overlap (normalized by query bigram count)
         scored = []
+        qlen = max(len(query_bigrams), 1)
         for doc in candidates:
-            doc_words = set(doc)
-            score = len(query_words & doc_words)
+            doc_bigrams = _bigrams(doc)
+            score = len(query_bigrams & doc_bigrams) / qlen
             scored.append((score, doc))
 
         scored.sort(key=lambda x: x[0], reverse=True)

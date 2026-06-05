@@ -259,7 +259,7 @@ class SafetyGuard:
 
         stamina = agent.dynamic.stamina
         if stamina > self.STAMINA_RUN_MIN and not agent.dynamic.injured:
-            speed = Speed.WALK
+            speed = Speed.RUN
         elif stamina > self.STAMINA_CRAWL_MAX:
             speed = Speed.WALK
         else:

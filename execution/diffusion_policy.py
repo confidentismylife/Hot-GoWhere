@@ -401,9 +401,10 @@ class DiffusionPolicy:
         if self.text_encoder is None or not text:
             return torch.zeros(1, self._text_dim).cuda()
 
+        device = next(self.model.parameters()).device
         tokens = self.tokenizer(
             text, return_tensors="pt", truncation=True, max_length=256
-        ).to(self.model.device)
+        ).to(device)
 
         with torch.no_grad():
             output = self.text_encoder(**tokens)

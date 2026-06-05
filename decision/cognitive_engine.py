@@ -31,6 +31,7 @@ class DecisionResult:
     reasoning: str
     risk_assessment: str
     compute_time: float
+    raw_data: dict = None  # Full parsed LLM JSON (for command roles)
 
 
 class LLMCognitiveEngine:
@@ -222,13 +223,17 @@ class LLMCognitiveEngine:
     def _parse_decision(self, agent: Agent, raw_text: str,
                         env: EnvironmentSnapshot,
                         compute_time: float) -> DecisionResult:
-        """Parse LLM output JSON → DecisionResult."""
+        """Parse LLM output JSON → DecisionResult.
+
+        For civilian agents: extracts target_exit, speed, cooperation, reasoning.
+        For command agents: preserves full raw_data dict for role-specific parsing.
+        """
         try:
             data = PromptManager.parse_response(raw_text)
         except json.JSONDecodeError:
             return self._fallback_decision(agent, env)
 
-        # Parse target exit
+        # Parse target exit (common to civilian + guide)
         target_exit_idx = 0
         target_pos = env.exits[0] if env.exits else (0.0, 0.0)
         exit_str = data.get("target_exit", "")
@@ -261,6 +266,7 @@ class LLMCognitiveEngine:
             reasoning=data.get("reasoning", ""),
             risk_assessment=data.get("risk_assessment", ""),
             compute_time=compute_time,
+            raw_data=data,  # Full parsed JSON for command roles
         )
 
     def _fallback_decision(self, agent: Agent,

@@ -78,7 +78,7 @@ def main():
         help="Enable diffusion model trajectory generation (replaces social force)"
     )
     parser.add_argument(
-        "--vlm-interval", type=int, default=30,
+        "--vlm-interval", type=int, default=None,
         help="VLM call interval in ticks (default: 30)"
     )
     parser.add_argument(
@@ -112,7 +112,7 @@ def main():
     orchestrator = SimulationOrchestrator(config_path=args.config)
 
     # Apply CLI overrides
-    if args.agents:
+    if args.agents is not None:
         orchestrator.num_agents = args.agents
         orchestrator.cfg["simulation"]["num_agents"] = args.agents
 
@@ -133,7 +133,7 @@ def main():
         orchestrator.cfg.setdefault("yolo", {})["enabled"] = True
     if args.diffusion:
         orchestrator.cfg.setdefault("diffusion", {})["enabled"] = True
-    if args.vlm_interval:
+    if args.vlm_interval is not None:
         orchestrator.cfg.setdefault("vlm", {})["call_interval"] = args.vlm_interval
     if args.vlm_mock:
         orchestrator.cfg.setdefault("vlm", {})["mock"] = True

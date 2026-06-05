@@ -181,8 +181,13 @@ class PromptManager:
         # Remove markdown code blocks if present
         if text.startswith("```"):
             lines = text.split("\n")
-            # Remove first line (```json) and last line (```)
-            text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+            start = 1  # Skip opening fence
+            end = len(lines)
+            for i in range(len(lines) - 1, 0, -1):
+                if lines[i].strip().startswith("```"):
+                    end = i
+                    break
+            text = "\n".join(lines[start:end])
 
         # Find JSON bounds
         start = text.find("{")

@@ -213,7 +213,7 @@ class SimulationOrchestrator:
             if random.random() < 0.3:
                 a1.dynamic.has_children = True
             if random.random() < 0.3:
-                a2.dynamic.has_elderly = a2.profile.age > 60
+                a2.dynamic.has_elderly = a2.profile.age > 55
 
     def _spawn_command_agents(self):
         """Spawn multi-role command agents (commander, firefighter, guide).
@@ -340,7 +340,7 @@ class SimulationOrchestrator:
 火灾覆盖: {fire_coverage:.0%} 区域
 
 [人员统计]
-总人数: {self.num_agents}
+总人数: {len(self.agents)}
 已疏散: {evac}
 伤亡: {dead}
 仍在现场: {alive}
@@ -511,13 +511,26 @@ class SimulationOrchestrator:
                     self._apply_command_decisions(command_decisions, env_snapshot)
 
             # ---- 3.5 VLM + YOLO 双通道感知 (v2.0) ----
+            frame = None
+            vlm_desc = ""
+            yolo_res = None
+            dirty = False
+
+            # 通道A: VLM 语义理解 (on its own interval)
             if self.vlm is not None and self.tick % self.vlm.call_interval == 0:
                 frame = self._render_cctv_frame()
-                # 通道A: VLM 语义理解
                 vlm_desc = self.vlm.perceive(frame, self.tick, env_snapshot)
-                # 通道B: YOLO 人员检测
-                yolo_res = self.yolo.detect(frame) if self.yolo is not None else None
-                # 只在有新数据时更新 LLM 引擎的感知上下文 (持久化缓存)
+                dirty = True
+
+            # 通道B: YOLO 人员检测 (independent, on its own interval)
+            yolo_interval = self.yolo.call_interval if self.yolo is not None else 10
+            if self.yolo is not None and self.tick % yolo_interval == 0:
+                if frame is None:
+                    frame = self._render_cctv_frame()
+                yolo_res = self.yolo.detect(frame)
+                dirty = True
+
+            if dirty:
                 self.llm_engine.set_perception_context(vlm_desc, yolo_res)
 
             # ---- 4. Group Intelligence ----
@@ -554,17 +567,19 @@ class SimulationOrchestrator:
 
             if self.tick % 100 == 0:
                 avg_tt = np.mean(tick_times[-100:])
+                total = len(self.agents)
+                alive = total - self.evacuated_count - self.casualty_count
                 print(f"[Tick {self.tick:5d}] "
                       f"Time: {self.sim_time:6.1f}s | "
                       f"Tick: {tick_time:5.1f}ms avg: {avg_tt:5.1f}ms | "
-                      f"Alive: {self.num_agents - self.evacuated_count - self.casualty_count:4d} | "
+                      f"Alive: {alive:4d} | "
                       f"Evac: {self.evacuated_count:4d} | "
                       f"Dead: {self.casualty_count:4d} | "
                       f"LLM: {self.decision_count:5d} | "
                       f"Blocked: {self.safety_blocks:3d}/{self.safety_modifications:3d}")
 
             # ---- 9. Termination check ----
-            remaining = self.num_agents - self.evacuated_count - self.casualty_count
+            remaining = len(self.agents) - self.evacuated_count - self.casualty_count
             if remaining <= 0:
                 print(f"\n[Orchestrator] All agents evacuated or deceased at "
                       f"t={self.sim_time:.1f}s")
@@ -681,8 +696,8 @@ class SimulationOrchestrator:
                                  env_snapshot: EnvironmentSnapshot):
         """Parse LLM commander outputs into broadcasts and guidance.
 
-        Commander decisions are parsed from their role-specific JSON output
-        and converted into messages that influence civilian behavior.
+        Commander decisions use the raw LLM JSON (d.raw_data) which preserves
+        role-specific fields like broadcast_message, action, target_position.
         """
         for agent_id, d in decisions.items():
             agent = self._find_agent(agent_id)
@@ -691,12 +706,8 @@ class SimulationOrchestrator:
 
             role = agent.profile.role
 
-            # Parse commander JSON from reasoning text (which contains the raw LLM output)
-            try:
-                import json
-                data = json.loads(d.reasoning) if d.reasoning else {}
-            except (json.JSONDecodeError, TypeError):
-                data = {}
+            # Use raw_data — the full parsed LLM JSON, not just reasoning text
+            data = d.raw_data or {}
 
             if role == AgentRole.GLOBAL_COMMANDER.value:
                 # Extract broadcast message for civilians
@@ -872,11 +883,12 @@ class SimulationOrchestrator:
         print(f"  Ticks:            {self.tick}")
         print(f"  Avg tick time:    {np.mean(tick_times):.1f}ms")
         print(f"  Max tick time:    {np.max(tick_times):.1f}ms")
-        print(f"  Total agents:     {self.num_agents}")
+        civilian_n = self.num_agents
+        print(f"  Total agents:     {len(self.agents)} (civilian: {civilian_n})")
         print(f"  Evacuated:        {self.evacuated_count} "
-              f"({self.evacuated_count/self.num_agents*100:.1f}%)")
+              f"({self.evacuated_count/civilian_n*100:.1f}%)")
         print(f"  Casualties:       {self.casualty_count} "
-              f"({self.casualty_count/self.num_agents*100:.1f}%)")
+              f"({self.casualty_count/civilian_n*100:.1f}%)")
         print(f"  LLM decisions:    {self.decision_count}")
         print(f"  Safety blocked:   {self.safety_blocks}")
         print(f"  Safety modified:  {self.safety_modifications}")

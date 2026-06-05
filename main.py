@@ -8,6 +8,7 @@ Usage:
     python main.py --no-viz               # Headless mode
     python main.py --web --port 8080      # Web visualization (GPU cloud)
     python main.py --gradio              # Gradio interactive dashboard
+    python main.py --vlm --diffusion     # v2.0: VLM perception + diffusion trajectories
 """
 
 import argparse
@@ -64,6 +65,26 @@ def main():
         "--gradio-port", type=int, default=8081,
         help="Gradio server port (default: 8081)"
     )
+    parser.add_argument(
+        "--vlm", action="store_true",
+        help="Enable VLM visual perception (Qwen-VL-7B-INT4, ~5GB VRAM)"
+    )
+    parser.add_argument(
+        "--yolo", action="store_true",
+        help="Enable YOLO person detection (complementary to VLM)"
+    )
+    parser.add_argument(
+        "--diffusion", action="store_true",
+        help="Enable diffusion model trajectory generation (replaces social force)"
+    )
+    parser.add_argument(
+        "--vlm-interval", type=int, default=30,
+        help="VLM call interval in ticks (default: 30)"
+    )
+    parser.add_argument(
+        "--vlm-mock", action="store_true",
+        help="Use mock VLM (synthetic NL from env state, no GPU needed)"
+    )
     args = parser.parse_args()
 
     # --- Web 模式: 启动 Flask 服务器 ---
@@ -104,6 +125,18 @@ def main():
     if args.record:
         orchestrator.cfg["visualization"]["mode"] = "headless"
         orchestrator.cfg["visualization"]["frame_interval"] = args.frame_interval
+
+    # v2.0 feature toggles
+    if args.vlm:
+        orchestrator.cfg.setdefault("vlm", {})["enabled"] = True
+    if args.yolo:
+        orchestrator.cfg.setdefault("yolo", {})["enabled"] = True
+    if args.diffusion:
+        orchestrator.cfg.setdefault("diffusion", {})["enabled"] = True
+    if args.vlm_interval:
+        orchestrator.cfg.setdefault("vlm", {})["call_interval"] = args.vlm_interval
+    if args.vlm_mock:
+        orchestrator.cfg.setdefault("vlm", {})["mock"] = True
 
     # Run
     try:

@@ -393,13 +393,28 @@ class SimulationOrchestrator:
         # v2: VLM 感知器 + YOLO 检测器 (双通道)
         self.vlm = None
         self.yolo = None
+        vlm_mock = self.cfg.get("vlm", {}).get("mock", False)
         if self.use_vlm:
-            from perception.vlm_perceiver import VLMPerceiver
-            self.vlm = VLMPerceiver(
-                model_name=self.cfg["vlm"].get("model", "Qwen/Qwen2.5-VL-7B-Instruct-AWQ"),
-                call_interval=self.cfg["vlm"].get("call_interval", 30),
-            )
-            self.vlm.initialize()
+            from perception.vlm_perceiver import VLMPerceiver, MockVLMPerceiver
+
+            if vlm_mock:
+                self.vlm = MockVLMPerceiver(
+                    call_interval=self.cfg["vlm"].get("call_interval", 30),
+                )
+                self.vlm.initialize()
+            else:
+                try:
+                    self.vlm = VLMPerceiver(
+                        model_name=self.cfg["vlm"].get("model", "Qwen/Qwen2.5-VL-7B-Instruct-AWQ"),
+                        call_interval=self.cfg["vlm"].get("call_interval", 30),
+                    )
+                    self.vlm.initialize()
+                except Exception as e:
+                    print(f"[Orch] VLM load failed ({e}), falling back to mock.")
+                    self.vlm = MockVLMPerceiver(
+                        call_interval=self.cfg["vlm"].get("call_interval", 30),
+                    )
+                    self.vlm.initialize()
 
             # YOLO 检测通道 (与VLM互补)
             from perception.yolo_detector import YOLODetector

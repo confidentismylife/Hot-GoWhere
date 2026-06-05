@@ -220,3 +220,126 @@ class VLMPerceiver:
             import torch
             torch.cuda.empty_cache()
             print("[VLM] Shutdown complete.")
+
+
+class MockVLMPerceiver:
+    """VLM mock for development/testing — generates NL from env state.
+
+    Same interface as VLMPerceiver but uses numeric env data to produce
+    realistic Chinese scene descriptions. No GPU required.
+
+    Usage:
+        vlm = MockVLMPerceiver(call_interval=30)
+        desc = vlm.perceive(None, tick, env_snapshot)
+    """
+
+    def __init__(self, call_interval: int = 30):
+        self.call_interval = call_interval
+        self.last_description: str = ""
+        self.last_call_tick: int = -999999
+        self.total_calls: int = 0
+        self.total_time: float = 0.0
+
+    def initialize(self):
+        print("[MockVLM] Using synthetic scene descriptions (no GPU).")
+
+    def perceive(self, frame, tick: int, env_snapshot=None) -> str:
+        if tick - self.last_call_tick < self.call_interval:
+            return self.last_description
+
+        if env_snapshot is None:
+            return self.last_description or "监控画面暂无数据。"
+
+        import time
+        t0 = time.time()
+
+        desc = self._synthesize(env_snapshot)
+        self.last_description = desc
+        self.last_call_tick = tick
+        self.total_calls += 1
+        self.total_time += (time.time() - t0) * 1000
+        return desc
+
+    def _synthesize(self, env) -> str:
+        grid = env.grid
+        smoke_field = grid[:, :, 0]
+        fire_field = grid[:, :, 3]
+
+        smoke_max = float(smoke_field.max())
+        smoke_mean = float(smoke_field.mean())
+        fire_pixels = int((fire_field > 0.5).sum())
+
+        # Smoke description
+        if smoke_max < 0.1:
+            smoke_desc = "现场无明显烟雾，视野清晰。"
+        elif smoke_max < 0.3:
+            smoke_desc = "轻微烟雾出现在局部区域，能见度良好。"
+        elif smoke_max < 0.6:
+            region = self._smoke_region(smoke_field, env)
+            smoke_desc = f"烟雾浓度中等，{region}方向烟雾较明显，建议低姿前进。"
+        else:
+            region = self._smoke_region(smoke_field, env)
+            smoke_desc = f"浓烟弥漫，{region}区域能见度严重下降，部分区域伸手不见五指。"
+
+        # Fire description
+        if fire_pixels == 0:
+            fire_desc = "未见明火。"
+        elif fire_pixels < 20:
+            fire_desc = "局部出现明火，火焰范围较小。"
+        elif fire_pixels < 80:
+            fire_desc = "火势正在扩大，火焰高度约1-2米，伴有大量黑烟。"
+        else:
+            fire_desc = "大面积燃烧，火势猛烈，结构存在坍塌风险。"
+
+        # Exit status
+        exit_parts = []
+        for i, ep in enumerate(env.exits):
+            e_smoke = env.smoke_at(np.array(ep, dtype=np.float64))
+            if e_smoke < 0.3:
+                exit_parts.append(f"出口{i+1}畅通")
+            elif e_smoke < 0.6:
+                exit_parts.append(f"出口{i+1}有烟雾但可通行")
+            else:
+                exit_parts.append(f"出口{i+1}被浓烟封锁")
+        exit_desc = "；".join(exit_parts)
+
+        # Structural
+        struct_field = grid[:, :, 2]
+        struct_min = float(struct_field.min())
+        if struct_min > 0.8:
+            struct_desc = "建筑结构完好。"
+        elif struct_min > 0.5:
+            struct_desc = "部分墙体出现裂缝，天花板有碎片掉落。"
+        else:
+            struct_desc = "建筑结构严重受损，部分区域可能坍塌。"
+
+        return (
+            f"烟雾分布: {smoke_desc} "
+            f"火情: {fire_desc} "
+            f"出口状态: {exit_desc}。"
+            f"建筑: {struct_desc}"
+        )
+
+    @staticmethod
+    def _smoke_region(smoke_field, env) -> str:
+        """Determine which region has heaviest smoke."""
+        h, w = smoke_field.shape
+        quadrants = {
+            "东北": smoke_field[:h//2, w//2:].mean(),
+            "西北": smoke_field[:h//2, :w//2].mean(),
+            "东南": smoke_field[h//2:, w//2:].mean(),
+            "西南": smoke_field[h//2:, :w//2].mean(),
+        }
+        return max(quadrants, key=quadrants.get)
+
+    @property
+    def stats(self) -> dict:
+        return {
+            "total_calls": self.total_calls,
+            "avg_time_ms": self.total_time / max(1, self.total_calls),
+            "last_description": self.last_description[:80] + "...",
+            "mode": "mock",
+        }
+
+    def shutdown(self):
+        print("[MockVLM] Shutdown.")

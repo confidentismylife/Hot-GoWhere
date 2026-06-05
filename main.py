@@ -7,6 +7,7 @@ Usage:
     python main.py --config my_conf.yaml  # Custom config
     python main.py --no-viz               # Headless mode
     python main.py --web --port 8080      # Web visualization (GPU cloud)
+    python main.py --gradio              # Gradio interactive dashboard
 """
 
 import argparse
@@ -55,6 +56,14 @@ def main():
         "--port", "-p", type=int, default=8080,
         help="Web server port (default: 8080)"
     )
+    parser.add_argument(
+        "--gradio", action="store_true",
+        help="Launch Gradio interactive dashboard (with NL query, charts, manual intervention)"
+    )
+    parser.add_argument(
+        "--gradio-port", type=int, default=8081,
+        help="Gradio server port (default: 8081)"
+    )
     args = parser.parse_args()
 
     # --- Web 模式: 启动 Flask 服务器 ---
@@ -65,6 +74,16 @@ def main():
             num_agents=args.agents,
             port=args.port,
             frame_interval=args.frame_interval,
+        )
+        return
+
+    # --- Gradio 模式: 启动交互式仪表板 ---
+    if args.gradio:
+        from visualization.gradio_app import start_gradio
+        start_gradio(
+            config_path=args.config,
+            num_agents=args.agents,
+            port=args.gradio_port,
         )
         return
 

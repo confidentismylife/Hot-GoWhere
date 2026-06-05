@@ -110,15 +110,20 @@ class LLMCognitiveEngine:
     def _build_messages(self, agent: Agent, env: EnvironmentSnapshot,
                         knowledge_docs: List[str]) -> Tuple[list, str]:
         """Build chat messages. Returns (messages, group_key)."""
-        system = self.prompt_manager.build_system(env.disaster_type, knowledge_docs)
+        role = agent.profile.role
+        equipment = getattr(agent.profile, 'equipment', '')
+        system = self.prompt_manager.build_system(
+            env.disaster_type, knowledge_docs,
+            role=role, equipment=equipment if isinstance(equipment, str) else '、'.join(equipment)
+        )
         user = self.prompt_manager.build_user(
             agent, env,
             vlm_description=self._vlm_description,
             yolo_result=self._yolo_result,
         )
 
-        # Group key: used by vLLM prefix caching
-        group_key = env.disaster_type
+        # Group key: role + disaster_type for prefix caching
+        group_key = f"{role}_{env.disaster_type}"
 
         return [
             {"role": "system", "content": system},

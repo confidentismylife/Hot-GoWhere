@@ -19,6 +19,7 @@ from decision.agent_state import Agent, AgentProfile, AgentDynamic, Speed, Coope
 from decision.cognitive_engine import LLMCognitiveEngine, DecisionResult
 from decision.knowledge_base import DisasterKnowledgeBase
 from decision.safety_guard import SafetyGuard
+from decision.agent_roles import AgentRole, define_zones
 from perception.environment import DisasterSimulator, EnvironmentSnapshot
 from execution.batched_physics import BatchedPhysics
 from execution.diffusion_policy import build_scene_map
@@ -92,6 +93,7 @@ class SimulationOrchestrator:
         self.total_llm_time = 0.0
         self.safety_blocks = 0       # Count of LLM decisions blocked by safety guard
         self.safety_modifications = 0  # Count of decisions modified by safety guard
+        self._command_broadcasts = []  # Commander-generated broadcasts (injected into civilian prompts)
 
     # ================================================================
     # Agent Generation
@@ -213,28 +215,179 @@ class SimulationOrchestrator:
             if random.random() < 0.3:
                 a2.dynamic.has_elderly = a2.profile.age > 60
 
+    def _spawn_command_agents(self):
+        """Spawn multi-role command agents (commander, firefighter, guide).
+
+        These agents use role-specific LLM prompts and do NOT participate
+        in the social-force physics engine. Their decisions influence
+        civilian behavior through broadcasts and guidance.
+        """
+        zones = define_zones(self.exits, self.width, self.height)
+        disaster_origin = self.cfg["environment"]["disaster_origin"]
+        num_command_agents = 0
+
+        # --- 1 Global Commander ---
+        profile = AgentProfile(
+            role=AgentRole.GLOBAL_COMMANDER.value,
+            age=45, occupation="fire_chief",
+            familiarity=1.0, max_speed=0.0,
+            trust_authority=1.0, altruism=0.9,
+            equipment=["对讲机", "建筑蓝图", "监控终端"],
+        )
+        # Position at a safe command post (center-top of map)
+        dynamic = AgentDynamic(
+            position=np.array([self.width / 2, self.height - 2], dtype=np.float64),
+            stamina=100.0, known_exit_positions=self.exits,
+            has_new_info=True,
+        )
+        self.agents.append(Agent(profile=profile, dynamic=dynamic))
+        num_command_agents += 1
+
+        # --- Area Commanders (one per exit) ---
+        for i, exit_pos in enumerate(self.exits):
+            profile = AgentProfile(
+                role=AgentRole.AREA_COMMANDER.value,
+                age=35, occupation="station_staff",
+                familiarity=0.9, max_speed=1.2,
+                trust_authority=0.9, altruism=0.8,
+                equipment=["对讲机", "扩音器"],
+            )
+            # Position near their assigned exit
+            ex, ey = exit_pos
+            sx = max(2, min(self.width - 2, ex + random.uniform(-5, 5)))
+            sy = max(2, min(self.height - 2, ey + random.uniform(-5, 5)))
+            dynamic = AgentDynamic(
+                position=np.array([sx, sy], dtype=np.float64),
+                stamina=100.0, known_exit_positions=[exit_pos],
+                has_new_info=True,
+            )
+            self.agents.append(Agent(profile=profile, dynamic=dynamic))
+            num_command_agents += 1
+
+        # --- Firefighters ---
+        firefighter_count = max(2, self.num_agents // 100)  # ~2% of civilians
+        for _ in range(firefighter_count):
+            profile = AgentProfile(
+                role=AgentRole.FIREFIGHTER.value,
+                age=random.randint(25, 40), occupation="firefighter",
+                familiarity=0.7, max_speed=1.6,
+                risk_aversion=0.3, altruism=0.95, trust_authority=0.9,
+                equipment=["呼吸器", "灭火器", "对讲机", "热成像仪"],
+            )
+            # Start near disaster origin but at safe distance
+            ox, oy = disaster_origin
+            sx = max(5, min(self.width - 5, ox + random.uniform(-15, 15)))
+            sy = max(5, min(self.height - 5, oy + random.uniform(-15, 15)))
+            dynamic = AgentDynamic(
+                position=np.array([sx, sy], dtype=np.float64),
+                stamina=100.0, known_exit_positions=self.exits,
+                has_new_info=True,
+            )
+            self.agents.append(Agent(profile=profile, dynamic=dynamic))
+            num_command_agents += 1
+
+        # --- Guides ---
+        guide_count = min(len(self.exits) * 2, 8)
+        for i in range(guide_count):
+            assigned_exit = self.exits[i % len(self.exits)]
+            profile = AgentProfile(
+                role=AgentRole.GUIDE.value,
+                age=random.randint(25, 45), occupation="station_staff",
+                familiarity=0.9, max_speed=1.3,
+                altruism=0.9, trust_authority=0.8,
+                equipment=["反光背心", "手电筒", "扩音器"],
+            )
+            ex, ey = assigned_exit
+            sx = max(5, min(self.width - 5, ex + random.uniform(-10, 10)))
+            sy = max(5, min(self.height - 5, ey - random.uniform(5, 15)))
+            dynamic = AgentDynamic(
+                position=np.array([sx, sy], dtype=np.float64),
+                stamina=100.0, known_exit_positions=[assigned_exit],
+                has_new_info=True,
+            )
+            self.agents.append(Agent(profile=profile, dynamic=dynamic))
+            num_command_agents += 1
+
+        print(f"[Orchestrator] Spawned {num_command_agents} command agents "
+              f"(1 global, {len(self.exits)} area, "
+              f"{firefighter_count} firefighter, {guide_count} guide)")
+
+    def _build_command_context(self, agent: Agent,
+                               env: EnvironmentSnapshot) -> str:
+        """Build NL context for command-role agents (global view)."""
+        from perception.nl_converter import NLConverter
+
+        # Commander sees aggregate stats, not just personal position
+        alive = sum(1 for a in self.agents if a.dynamic.alive and not a.dynamic.evacuated)
+        evac = sum(1 for a in self.agents if a.dynamic.evacuated)
+        dead = sum(1 for a in self.agents if not a.dynamic.alive)
+
+        # Smoke coverage estimate
+        smoke_grid = env.grid[:, :, 0]
+        smoke_coverage = float((smoke_grid > 0.3).mean())
+        fire_coverage = float((env.grid[:, :, 3] > 0.5).mean())
+
+        exit_lines = []
+        for i, ep in enumerate(env.exits):
+            e_smoke = env.smoke_at(np.array(ep, dtype=np.float64))
+            status = "通畅" if e_smoke < 0.3 else ("有烟雾" if e_smoke < 0.6 else "浓烟封锁")
+            exit_lines.append(f"  出口{i+1}({ep[0]:.0f},{ep[1]:.0f}): {status}")
+
+        return f"""[全局态势]
+时间: {env.timestamp:.0f}秒
+灾害类型: {env.disaster_type}
+烟雾覆盖: {smoke_coverage:.0%} 区域
+火灾覆盖: {fire_coverage:.0%} 区域
+
+[人员统计]
+总人数: {self.num_agents}
+已疏散: {evac}
+伤亡: {dead}
+仍在现场: {alive}
+
+[出口状态]
+{chr(10).join(exit_lines)}
+
+[官方广播记录]
+{env.official_broadcast or '暂无'}
+
+[指挥角色]
+{agent.profile.role}: {agent.profile.occupation}
+位置: ({agent.position[0]:.0f}, {agent.position[1]:.0f})"""
+
+    def _get_broadcast(self) -> str:
+        """Return latest commander-generated broadcast, with cleanup."""
+        # Remove broadcasts older than 30 seconds
+        cutoff = self.sim_time - 30.0
+        self._command_broadcasts = [
+            b for b in self._command_broadcasts
+            if b.get("tick", 0) * self.dt > cutoff
+        ]
+        if self._command_broadcasts:
+            # Return the most recent 3 messages, joined
+            recent = self._command_broadcasts[-3:]
+            return " | ".join(b["message"] for b in recent)
+        return ""
+
     # ================================================================
     # Main Simulation Loop
     # ================================================================
 
     def run(self):
-        """Execute the full simulation."""
-        # v2.0 feature flags
+        """Execute the full simulation with multi-role agents."""
         self.use_vlm = self.cfg.get("vlm", {}).get("enabled", False)
         self.use_diffusion = self.cfg.get("diffusion", {}).get("enabled", False)
 
         print("\n" + "=" * 60)
+        print("   LLM-Powered Crowd Evacuation — Multi-Role v2.1")
         if self.use_vlm or self.use_diffusion:
-            print("   LLM Evacuation Simulation — v2.0 BETA")
             print(f"   VLM: {'ON' if self.use_vlm else 'OFF'}  "
                   f"Trajectory: {'DIFFUSION' if self.use_diffusion else 'SOCIAL FORCE'}")
-        else:
-            print("   LLM-Powered Crowd Evacuation Simulation")
-            print("   Single GPU (4090 24GB) Edition")
         print("=" * 60 + "\n")
 
         # Initialize
         self.generate_agents()
+        self._spawn_command_agents()
         self.llm_engine.initialize()
 
         # v2: VLM 感知器 + YOLO 检测器 (双通道)
@@ -321,9 +474,26 @@ class SimulationOrchestrator:
             # ---- 3. Collect LLM results ----
             decisions = self.llm_engine.collect_results()
             if decisions:
-                self.decision_count += len(decisions)  # Only count actual results
+                # Separate civilian vs command decisions
+                civilian_decisions = {}
+                command_decisions = {}
+                for aid, d in decisions.items():
+                    agent = self._find_agent(aid)
+                    if agent and agent.profile.role != AgentRole.CIVILIAN.value:
+                        command_decisions[aid] = d
+                    else:
+                        civilian_decisions[aid] = d
+
+                self.decision_count += len(decisions)
                 self.total_llm_time += sum(d.compute_time for d in decisions.values())
-                self._apply_decisions(decisions, env_snapshot)
+
+                # Apply civilian decisions normally
+                if civilian_decisions:
+                    self._apply_decisions(civilian_decisions, env_snapshot)
+
+                # Process command decisions → generate broadcasts
+                if command_decisions:
+                    self._apply_command_decisions(command_decisions, env_snapshot)
 
             # ---- 3.5 VLM + YOLO 双通道感知 (v2.0) ----
             if self.vlm is not None and self.tick % self.vlm.call_interval == 0:
@@ -485,15 +655,102 @@ class SimulationOrchestrator:
             if len(agent.dynamic.memory_events) > 20:
                 agent.dynamic.memory_events = agent.dynamic.memory_events[-20:]
 
-    def _get_broadcast(self) -> str:
-        """Generate official broadcast messages at specific times."""
-        if 5 < self.sim_time < 6:
-            return "请注意,西南方向发生火灾,请从北侧和东侧出口有序撤离。"
-        if 30 < self.sim_time < 31:
-            return "东出口出现拥堵,请考虑使用西出口。"
-        if 60 < self.sim_time < 61:
-            return "消防人员已到达,请保持冷静,听从指挥。"
-        return ""
+    def _find_agent(self, agent_id: str):
+        """Find agent by ID. Returns None if not found."""
+        for a in self.agents:
+            if a.id == agent_id:
+                return a
+        return None
+
+    def _apply_command_decisions(self, decisions: Dict[str, DecisionResult],
+                                 env_snapshot: EnvironmentSnapshot):
+        """Parse LLM commander outputs into broadcasts and guidance.
+
+        Commander decisions are parsed from their role-specific JSON output
+        and converted into messages that influence civilian behavior.
+        """
+        for agent_id, d in decisions.items():
+            agent = self._find_agent(agent_id)
+            if agent is None:
+                continue
+
+            role = agent.profile.role
+
+            # Parse commander JSON from reasoning text (which contains the raw LLM output)
+            try:
+                import json
+                data = json.loads(d.reasoning) if d.reasoning else {}
+            except (json.JSONDecodeError, TypeError):
+                data = {}
+
+            if role == AgentRole.GLOBAL_COMMANDER.value:
+                # Extract broadcast message for civilians
+                broadcast = data.get("broadcast_message", "")
+                if broadcast:
+                    self._command_broadcasts.append({
+                        "tick": self.tick,
+                        "message": broadcast,
+                        "source": "global_commander",
+                    })
+
+                # Store area priorities
+                priorities = data.get("area_priorities", [])
+                if priorities:
+                    env_snapshot.official_broadcast = broadcast
+
+            elif role == AgentRole.AREA_COMMANDER.value:
+                broadcast = data.get("broadcast_message", "")
+                if broadcast:
+                    self._command_broadcasts.append({
+                        "tick": self.tick,
+                        "message": broadcast,
+                        "source": f"area_commander_{agent_id[:6]}",
+                    })
+
+            elif role == AgentRole.FIREFIGHTER.value:
+                # Parse firefighter action
+                action = data.get("action", "move")
+                target = data.get("target_position", agent.position.tolist())
+                agent.dynamic.reasoning_text = d.reasoning
+
+                # If rescuing, set cooperation to help_family equivalent
+                if action == "rescue":
+                    agent.dynamic.cooperation_choice = Cooperation.LEAD_OTHERS
+
+                # Apply target position if valid
+                if isinstance(target, list) and len(target) == 2:
+                    agent.dynamic.target_exit = np.array(target, dtype=np.float64)
+
+            elif role == AgentRole.GUIDE.value:
+                # Parse guide decision
+                exit_str = data.get("target_exit", "")
+                route = data.get("route_description", "")
+                call = data.get("call_for_followers", True)
+
+                # Determine which exit the guide is leading to
+                for i in range(1, len(env_snapshot.exits) + 1):
+                    if f"出口{i}" in exit_str:
+                        agent.dynamic.target_exit = np.array(
+                            env_snapshot.exits[i - 1], dtype=np.float64
+                        )
+                        break
+
+                if call and route:
+                    self._command_broadcasts.append({
+                        "tick": self.tick,
+                        "message": f"引导员: {route}",
+                        "source": f"guide_{agent_id[:6]}",
+                    })
+
+            # Common: apply speed decision
+            speed_str = data.get("speed", "walk")
+            try:
+                agent.dynamic.speed_choice = Speed(speed_str)
+            except ValueError:
+                agent.dynamic.speed_choice = Speed.WALK
+
+            agent.dynamic.last_decision_tick = self.tick
+            agent.dynamic.has_new_info = False
 
     # ================================================================
     # v2.0: 扩散模型轨迹播放

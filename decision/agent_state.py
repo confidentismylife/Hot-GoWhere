@@ -28,6 +28,8 @@ class AgentProfile:
     age: int = 30
     gender: str = "male"
     occupation: str = "office_worker"
+    role: str = "civilian"           # civilian | global_commander | area_commander | firefighter | guide
+    equipment: list = field(default_factory=list)  # Firefighter/guide equipment
 
     # 0 = first time here, 1 = knows every corner
     familiarity: float = 0.5

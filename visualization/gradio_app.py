@@ -1,25 +1,25 @@
 """Gradio interactive dashboard — LLM Evacuation Simulation v2.1.
 
-Features beyond the Flask web server:
-  - Natural language query: "出口3现在什么情况？" → stats-based answer
+Features:
+  - Live frame display (auto-refresh via file-based rendering)
+  - NL query: "出口3现在什么情况？" → stats-based answer
   - Manual commander intervention: type a broadcast message
   - Evacuation progress chart (Plotly time series)
-  - Agent role distribution pie chart
-  - Live frame + stats side by side
+  - Role distribution and safety stats
 
 Usage:
     python visualization/gradio_app.py --config config/default.yaml --port 8081
-    python main.py --web --port 8080  # Flask still available separately
+    python main.py --gradio --gradio-port 8081
 """
 
 import os
 import sys
 import io
 import time
+import tempfile
 import threading
 import argparse
 import numpy as np
-from pathlib import Path
 from typing import Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -41,7 +41,7 @@ _sim_state = {
     "running": False,
     "done": False,
     "error": None,
-    "frame_bytes": None,
+    "frame_path": None,      # Path to latest rendered PNG file
     "frame_count": 0,
     "tick": 0,
     "sim_time": 0.0,
@@ -57,16 +57,16 @@ _sim_state = {
     "lock": threading.Lock(),
 }
 
-# Manual broadcast queue (Gradio → simulation)
 _manual_broadcasts: list = []
 _broadcast_lock = threading.Lock()
-
-# Full orchestrator reference for NL queries
 _orchestrator_ref = None
+
+# Temp directory for frame files
+_FRAME_DIR = os.path.join(tempfile.gettempdir(), "evac_frames")
 
 
 # ================================================================
-# Frame renderer (reuse the same matplotlib logic)
+# Frame renderer
 # ================================================================
 
 def _fear_color(fear_level: float):
@@ -76,7 +76,7 @@ def _fear_color(fear_level: float):
 
 def render_frame_pil(agents, env, tick, sim_time, evacuated, casualties,
                      decisions, world_w, world_h):
-    """Render a frame → PIL Image (for Gradio)."""
+    """Render a frame → PIL Image."""
     fig, ax = plt.subplots(figsize=(10, 6), dpi=80)
     ax.set_xlim(0, world_w)
     ax.set_ylim(0, world_h)
@@ -133,7 +133,7 @@ def render_frame_pil(agents, env, tick, sim_time, evacuated, casualties,
         ax.add_patch(rect)
         ax.text(ex + 1.5, ey, f'E{i+1}', fontsize=8, fontweight='bold')
 
-    # Agents — color by role
+    # Agents
     role_colors = {
         "civilian": '#58a6ff',
         "global_commander": '#FFD700',
@@ -151,8 +151,7 @@ def render_frame_pil(agents, env, tick, sim_time, evacuated, casualties,
             marker = 's' if role != 'civilian' else 'o'
             ax.scatter(positions[:, 0], positions[:, 1],
                        c=colors, s=sizes, alpha=0.85, marker=marker,
-                       edgecolors='white', linewidth=0.3,
-                       label=role if role != 'civilian' else None)
+                       edgecolors='white', linewidth=0.3)
 
     # HUD
     alive = len(active)
@@ -185,6 +184,12 @@ def run_simulation_thread(config_path: str, num_agents: Optional[int] = None):
     global _sim_state, _orchestrator_ref
 
     from execution.orchestrator import SimulationOrchestrator
+
+    # Ensure frame dir exists
+    os.makedirs(_FRAME_DIR, exist_ok=True)
+    frame_path_a = os.path.join(_FRAME_DIR, "frame_a.png")
+    frame_path_b = os.path.join(_FRAME_DIR, "frame_b.png")
+    _toggle = False
 
     try:
         orch = SimulationOrchestrator(config_path)
@@ -223,7 +228,6 @@ def run_simulation_thread(config_path: str, num_agents: Optional[int] = None):
                 official_broadcast=orch._get_broadcast()
             )
 
-            # Inject manual broadcasts from Gradio
             with _broadcast_lock:
                 if _manual_broadcasts:
                     orch._command_broadcasts.extend(_manual_broadcasts)
@@ -270,35 +274,45 @@ def run_simulation_thread(config_path: str, num_agents: Optional[int] = None):
             orch.casualty_count = sum(1 for a in orch.agents if not a.dynamic.alive)
             active_count = orch.num_agents - orch.evacuated_count - orch.casualty_count
 
-            # Render every 10 ticks
+            # ---- Render frame to FILE (most reliable for Gradio) ----
             if orch.tick % 10 == 0:
-                frame_img = render_frame_pil(
-                    orch.agents, env_snapshot,
-                    orch.tick, orch.sim_time,
-                    orch.evacuated_count, orch.casualty_count,
-                    orch.decision_count, orch.width, orch.height,
-                )
-                buf = io.BytesIO()
-                frame_img.save(buf, format='PNG')
-                frame_bytes = buf.getvalue()
+                try:
+                    frame_img = render_frame_pil(
+                        orch.agents, env_snapshot,
+                        orch.tick, orch.sim_time,
+                        orch.evacuated_count, orch.casualty_count,
+                        orch.decision_count, orch.width, orch.height,
+                    )
+                    # Toggle between two files to avoid browser caching
+                    _toggle = not _toggle
+                    out_path = frame_path_a if _toggle else frame_path_b
+                    frame_img.save(out_path, format='PNG')
+                    # Also save to a stable path for initial load
+                    frame_img.save(os.path.join(_FRAME_DIR, "latest.png"), format='PNG')
 
-                with _sim_state["lock"]:
-                    _sim_state["frame_bytes"] = frame_bytes
-                    _sim_state["frame_count"] += 1
-                    _sim_state["tick"] = orch.tick
-                    _sim_state["sim_time"] = orch.sim_time
-                    _sim_state["active_count"] = active_count
-                    _sim_state["evacuated_count"] = orch.evacuated_count
-                    _sim_state["casualty_count"] = orch.casualty_count
-                    _sim_state["decision_count"] = orch.decision_count
-                    _sim_state["safety_blocks"] = orch.safety_blocks
-                    _sim_state["safety_modifications"] = orch.safety_modifications
-                    _sim_state["avg_tick_ms"] = np.mean(tick_times[-100:]) if tick_times else 0
-                    _sim_state["history"].append({
-                        "tick": orch.tick, "sim_time": round(orch.sim_time, 1),
-                        "active": active_count, "evacuated": orch.evacuated_count,
-                        "casualties": orch.casualty_count, "decisions": orch.decision_count,
-                    })
+                    with _sim_state["lock"]:
+                        _sim_state["frame_path"] = out_path
+                        _sim_state["frame_count"] += 1
+                except Exception as e:
+                    print(f"[Gradio] Render error: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            with _sim_state["lock"]:
+                _sim_state["tick"] = orch.tick
+                _sim_state["sim_time"] = orch.sim_time
+                _sim_state["active_count"] = active_count
+                _sim_state["evacuated_count"] = orch.evacuated_count
+                _sim_state["casualty_count"] = orch.casualty_count
+                _sim_state["decision_count"] = orch.decision_count
+                _sim_state["safety_blocks"] = orch.safety_blocks
+                _sim_state["safety_modifications"] = orch.safety_modifications
+                _sim_state["avg_tick_ms"] = np.mean(tick_times[-100:]) if tick_times else 0
+                _sim_state["history"].append({
+                    "tick": orch.tick, "sim_time": round(orch.sim_time, 1),
+                    "active": active_count, "evacuated": orch.evacuated_count,
+                    "casualties": orch.casualty_count, "decisions": orch.decision_count,
+                })
 
             tick_time = (time.perf_counter() - tick_start) * 1000
             tick_times.append(tick_time)
@@ -313,8 +327,7 @@ def run_simulation_thread(config_path: str, num_agents: Optional[int] = None):
         with _sim_state["lock"]:
             _sim_state["done"] = True
             _sim_state["running"] = False
-        print(f"[Gradio] Simulation complete. Evac: {orch.evacuated_count}/{orch.num_agents} | "
-              f"Safety blocked: {orch.safety_blocks} modified: {orch.safety_modifications}")
+        print(f"[Gradio] Simulation complete. Evac: {orch.evacuated_count}/{orch.num_agents}")
 
     except Exception as e:
         import traceback
@@ -326,7 +339,7 @@ def run_simulation_thread(config_path: str, num_agents: Optional[int] = None):
 
 
 # ================================================================
-# NL Query engine (rules-based, no extra LLM)
+# NL Query engine
 # ================================================================
 
 def answer_query(question: str) -> str:
@@ -343,25 +356,20 @@ def answer_query(question: str) -> str:
         blocks = _sim_state["safety_blocks"]
         mods = _sim_state["safety_modifications"]
         avg_ms = _sim_state["avg_tick_ms"]
-        history = list(_sim_state["history"])
         running = _sim_state["running"]
         done = _sim_state["done"]
-        error = _sim_state["error"]
 
     orch = _orchestrator_ref
-
     q = question.lower().strip()
 
-    # Exit status queries
     if "出口" in question or "exit" in q:
         if orch is None:
-            return "仿真尚未初始化，无法获取出口信息。"
+            return "仿真尚未初始化。"
         snap = orch.disaster.snapshot(0, 0, orch.exits, orch.obstacles)
         lines = []
         for i, ep in enumerate(orch.exits):
             s = snap.smoke_at(np.array(ep, dtype=np.float64))
             status = "畅通" if s < 0.3 else ("有烟雾" if s < 0.6 else "浓烟封锁")
-            # Count agents heading to this exit
             heading = sum(1 for a in orch.agents
                          if a.dynamic.target_exit is not None
                          and np.linalg.norm(a.dynamic.target_exit - np.array(ep)) < 2.0)
@@ -381,7 +389,6 @@ def answer_query(question: str) -> str:
                 lines.append(f"⚠ 出口{i+1}拥堵: {heading}人前往")
         return "\n".join(lines) if lines else "当前无明显拥堵。"
 
-    # Stats queries
     if "疏散率" in question or "evac rate" in q:
         rate = evac / total * 100 if total > 0 else 0
         return f"当前疏散率: {rate:.1f}% ({evac}/{total}), 伤亡: {dead}人, 活跃: {active}人"
@@ -417,7 +424,6 @@ def answer_query(question: str) -> str:
             return "最近指挥广播:\n" + "\n".join(f"  [{b.get('source','?')}] {b.get('message','')}" for b in broadcasts)
         return "暂无指挥广播。"
 
-    # Default: generic status
     rate = evac / total * 100 if total > 0 else 0
     status = "运行中" if running else ("已完成" if done else "未启动")
     return (f"仿真状态: {status}\n"
@@ -427,28 +433,40 @@ def answer_query(question: str) -> str:
 
 
 # ================================================================
-# Gradio UI update callbacks
+# Gradio UI callbacks
 # ================================================================
 
 def get_latest_frame():
-    """Return the latest frame as a PIL Image for Gradio."""
-    with _sim_state["lock"]:
-        fb = _sim_state["frame_bytes"]
-    if fb is None:
-        # Placeholder
-        fig, ax = plt.subplots(figsize=(10, 6), dpi=80)
-        ax.text(0.5, 0.5, 'Simulation initializing...\nPlease wait for LLM to load (~60s)',
-                ha='center', va='center', fontsize=16, color='gray', transform=ax.transAxes)
-        ax.set_facecolor('#F0F0F5')
-        ax.set_xticks([]); ax.set_yticks([])
-        buf = io.BytesIO()
-        fig.savefig(buf, format='png', dpi=80, bbox_inches='tight')
-        plt.close(fig)
-        buf.seek(0)
-        from PIL import Image
-        return Image.open(buf)
-    from PIL import Image
-    return Image.open(io.BytesIO(fb))
+    """Return latest frame file path. Gradio reads this file and serves it."""
+    try:
+        # Always return latest.png (updated every 10 ticks)
+        latest = os.path.join(_FRAME_DIR, "latest.png")
+        if os.path.exists(latest):
+            return latest
+        # Fallback: try frame_a / frame_b
+        with _sim_state["lock"]:
+            fp = _sim_state.get("frame_path")
+        if fp and os.path.exists(fp):
+            return fp
+        # No frame yet: generate placeholder
+        return _make_placeholder()
+    except Exception as e:
+        print(f"[Gradio] get_latest_frame error: {e}")
+        return _make_placeholder()
+
+
+def _make_placeholder():
+    """Generate a placeholder image and return its file path."""
+    path = os.path.join(_FRAME_DIR, "placeholder.png")
+    os.makedirs(_FRAME_DIR, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(10, 6), dpi=80)
+    ax.text(0.5, 0.5, 'Simulation initializing...\nPlease wait for LLM to load (~60s)',
+            ha='center', va='center', fontsize=16, color='gray', transform=ax.transAxes)
+    ax.set_facecolor('#F0F0F5')
+    ax.set_xticks([]); ax.set_yticks([])
+    fig.savefig(path, format='png', dpi=80, bbox_inches='tight')
+    plt.close(fig)
+    return path
 
 
 def get_stats_text():
@@ -470,9 +488,9 @@ def get_stats_text():
         avg_ms = _sim_state["avg_tick_ms"]
 
     if error:
-        return f"❌ 错误: {error}\n\n时间: {t:.1f}s | Tick: {tick}"
+        return f"## 错误\n\n{error}\n\n时间: {t:.1f}s | Tick: {tick}"
 
-    status = "🟢 运行中" if running else ("✅ 已完成" if done else "⏳ 等待启动...")
+    status = "运行中" if running else ("已完成" if done else "等待启动...")
     rate = evac / total * 100 if total > 0 else 0
 
     return f"""## {status}
@@ -538,7 +556,7 @@ def send_broadcast(message: str):
             "message": f"[手动指挥] {message.strip()}",
             "source": "manual_override",
         })
-    return f"✅ 已发送广播: {message.strip()}"
+    return f"已发送广播: {message.strip()}"
 
 
 # ================================================================
@@ -546,27 +564,32 @@ def send_broadcast(message: str):
 # ================================================================
 
 def build_ui():
-    css = """
-    .gradio-container { max-width: 1400px !important; }
-    footer { display: none !important; }
-    """
-    with gr.Blocks(css=css, title="LLM Evacuation Simulation", theme=gr.themes.Soft()) as demo:
+    # Create initial placeholder
+    placeholder = _make_placeholder()
+
+    with gr.Blocks(title="LLM Evacuation Simulation", theme=gr.themes.Soft()) as demo:
         gr.Markdown("# LLM-Powered Crowd Evacuation Simulation — Interactive Dashboard")
 
+        # ---- Timers ----
+        frame_timer = gr.Timer(2.0)
+        stats_timer = gr.Timer(2.0)
+        chart_timer = gr.Timer(5.0)
+
         with gr.Row():
-            # Left: Live frame
             with gr.Column(scale=3):
                 frame_display = gr.Image(
-                    label="仿真画面", value=get_latest_frame(),
-                    every=2.0,  # Auto-refresh every 2s
+                    value=placeholder,
+                    label="仿真画面",
+                    type="filepath",
                 )
+                frame_timer.tick(fn=get_latest_frame, outputs=frame_display)
 
-            # Right: Stats + query
             with gr.Column(scale=2):
-                stats_md = gr.Markdown(get_stats_text, every=2.0)
+                stats_md = gr.Markdown(get_stats_text())
+                stats_timer.tick(fn=get_stats_text, outputs=stats_md)
 
                 gr.Markdown("---")
-                gr.Markdown("### 💬 自然语言查询")
+                gr.Markdown("### 自然语言查询")
                 with gr.Row():
                     query_input = gr.Textbox(
                         placeholder="如: 出口3现在什么情况？/ 哪个出口最拥堵？/ 当前疏散率？",
@@ -576,24 +599,22 @@ def build_ui():
                     query_btn = gr.Button("查询", scale=1, variant="primary")
                 query_output = gr.Textbox(label="回答", lines=4, interactive=False)
 
-                # Quick query buttons
                 with gr.Row():
-                    gr.Button("出口状态").click(answer_query, inputs=[gr.Textbox(value="出口状态", visible=False)], outputs=query_output)
-                    gr.Button("拥堵检测").click(answer_query, inputs=[gr.Textbox(value="拥堵检测", visible=False)], outputs=query_output)
-                    gr.Button("疏散率").click(answer_query, inputs=[gr.Textbox(value="疏散率", visible=False)], outputs=query_output)
-                    gr.Button("安全约束").click(answer_query, inputs=[gr.Textbox(value="安全约束", visible=False)], outputs=query_output)
-                    gr.Button("角色分布").click(answer_query, inputs=[gr.Textbox(value="角色分布", visible=False)], outputs=query_output)
+                    gr.Button("出口状态").click(lambda: answer_query("出口状态"), outputs=query_output)
+                    gr.Button("拥堵检测").click(lambda: answer_query("拥堵检测"), outputs=query_output)
+                    gr.Button("疏散率").click(lambda: answer_query("疏散率"), outputs=query_output)
+                    gr.Button("安全约束").click(lambda: answer_query("安全约束"), outputs=query_output)
+                    gr.Button("角色分布").click(lambda: answer_query("角色分布"), outputs=query_output)
 
-        # Evacuation chart
         with gr.Row():
-            evac_plot = gr.Plot(label="疏散进度曲线", value=get_evac_plot, every=5.0)
+            evac_plot = gr.Plot(label="疏散进度曲线", value=get_evac_plot())
+            chart_timer.tick(fn=get_evac_plot, outputs=evac_plot)
 
-        # Commander intervention
         with gr.Row():
-            gr.Markdown("### 📢 手动指挥干预")
+            gr.Markdown("### 手动指挥干预")
             with gr.Column():
                 broadcast_input = gr.Textbox(
-                    placeholder="输入广播指令，如: 请所有人员立即从东出口撤离！西出口已被浓烟封锁！",
+                    placeholder="输入广播指令，如: 请所有人员立即从东出口撤离！",
                     label="广播内容",
                     lines=2,
                 )
@@ -601,7 +622,6 @@ def build_ui():
                 broadcast_status = gr.Textbox(label="状态", interactive=False)
                 broadcast_btn.click(send_broadcast, inputs=broadcast_input, outputs=broadcast_status)
 
-        # Wire up NL query
         query_btn.click(answer_query, inputs=query_input, outputs=query_output)
         query_input.submit(answer_query, inputs=query_input, outputs=query_output)
 
@@ -617,7 +637,6 @@ def start_gradio(config_path: str = "config/default.yaml",
                  port: int = 8081,
                  share: bool = False):
     """Start Gradio server with background simulation."""
-    # Start simulation thread
     sim_thread = threading.Thread(
         target=run_simulation_thread,
         args=(config_path, num_agents),
@@ -628,9 +647,8 @@ def start_gradio(config_path: str = "config/default.yaml",
 
     demo = build_ui()
     print(f"\n{'='*60}")
-    print(f"  🎨 Gradio 交互式仪表板已启动")
-    print(f"  📍 本地访问: http://localhost:{port}")
-    print(f"  📍 云端: 通过平台端口转发访问 {port} 端口")
+    print(f"  Gradio 交互式仪表板已启动")
+    print(f"  本地访问: http://localhost:{port}")
     print(f"{'='*60}\n")
 
     demo.queue(default_concurrency_limit=5).launch(

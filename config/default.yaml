@@ -74,6 +74,7 @@ vlm:
 yolo:
   model: "yolov8n.pt"                          # YOLO 检测模型
   conf_threshold: 0.35                         # 检测置信度阈值
+  call_interval: 10                            # YOLO 每N tick调用一次
 
 diffusion:
   enabled: false

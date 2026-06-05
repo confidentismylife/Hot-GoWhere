@@ -50,10 +50,12 @@ class YOLODetector:
 
     def __init__(self, model_name: str = "yolov8n.pt",
                  confidence_threshold: float = 0.35,
-                 device: str = "cuda"):
+                 device: str = "cuda",
+                 call_interval: int = 10):
         self.model_name = model_name
         self.conf_thresh = confidence_threshold
         self.device = device
+        self.call_interval = call_interval
 
         self.model = None
         self._initialized = False

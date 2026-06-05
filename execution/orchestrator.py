@@ -390,9 +390,12 @@ class SimulationOrchestrator:
         self._spawn_command_agents()
         self.llm_engine.initialize()
 
-        # v2: VLM 感知器 + YOLO 检测器 (双通道)
+        # v2: VLM 感知器 + YOLO 检测器 (双通道，独立开关)
         self.vlm = None
         self.yolo = None
+        self.use_yolo = self.cfg.get("yolo", {}).get("enabled", False)
+
+        # VLM 感知通道
         vlm_mock = self.cfg.get("vlm", {}).get("mock", False)
         if self.use_vlm:
             from perception.vlm_perceiver import VLMPerceiver, MockVLMPerceiver
@@ -416,11 +419,14 @@ class SimulationOrchestrator:
                     )
                     self.vlm.initialize()
 
-            # YOLO 检测通道 (与VLM互补)
+        # YOLO 检测通道 (独立于VLM)
+        if self.use_yolo:
             from perception.yolo_detector import YOLODetector
+            yolo_cfg = self.cfg.get("yolo", {})
             self.yolo = YOLODetector(
-                model_name=self.cfg.get("yolo", {}).get("model", "yolov8n.pt"),
-                confidence_threshold=self.cfg.get("yolo", {}).get("conf_threshold", 0.35),
+                model_name=yolo_cfg.get("model", "yolov8n.pt"),
+                confidence_threshold=yolo_cfg.get("conf_threshold", 0.35),
+                call_interval=yolo_cfg.get("call_interval", 10),
             )
             self.yolo.initialize()
             self.yolo.set_calibration(

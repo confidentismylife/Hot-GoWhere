@@ -52,22 +52,19 @@ class PromptManager:
             knowledge_section=knowledge_section,
         )
 
-    def build_user(self, agent: Agent, env: EnvironmentSnapshot) -> str:
-        """Build user prompt. Agent-specific context."""
-        context = self.nl_converter.full_context(agent, env)
-        return USER_PROMPT.format(context=context)
+    def build_user(self, agent: Agent, env: EnvironmentSnapshot,
+                   vlm_description: str = "",
+                   yolo_result=None) -> str:
+        """Build user prompt. Agent-specific context.
 
-    @staticmethod
-    def build_chat_messages(agent: Agent, env: EnvironmentSnapshot,
-                            system_prompt: str) -> list[dict]:
-        """Build full chat messages list for vLLM."""
-        user = USER_PROMPT.format(
-            context=NLConverter.full_context(agent, env)
+        v2.0: 支持双通道感知 (VLM + YOLO) 注入.
+        """
+        context = self.nl_converter.full_context(
+            agent, env,
+            vlm_description=vlm_description,
+            yolo_result=yolo_result,
         )
-        return [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user},
-        ]
+        return USER_PROMPT.format(context=context)
 
     @staticmethod
     def parse_response(text: str) -> dict:

@@ -85,6 +85,7 @@ class DiffusionTrajectoryModel(nn.Module):
       Input → TrajProj → + TimeEmb → Transformer × N → OutputHead
                 ↑                        ↑
            Start+Target约束          Cross-Attn ← Condition
+                                    (text_emb + scene_emb)
     """
 
     def __init__(self,
@@ -95,15 +96,20 @@ class DiffusionTrajectoryModel(nn.Module):
                  dropout: float = 0.1,
                  num_timesteps: int = 1000,
                  num_inference_steps: int = 100,
+                 text_dim: int = 768,
                  ):
         super().__init__()
 
         self.d_model = d_model
+        self.text_dim = text_dim
         self.num_timesteps = num_timesteps
         self.num_inference_steps = num_inference_steps
 
         # 轨迹投影
         self.traj_proj = nn.Linear(2, d_model)
+
+        # 场景编码器 (内置, 不依赖外部)
+        self.scene_encoder = SceneMapEncoder(d_model)
 
         # 时间嵌入
         self.time_embed = SinusoidalTimeEmbedding(d_model)
@@ -113,8 +119,15 @@ class DiffusionTrajectoryModel(nn.Module):
             nn.Linear(d_model * 2, d_model),
         )
 
-        # 条件编码 (这里只做投影, 实际编码由外部完成)
-        self.cond_proj = nn.Linear(d_model * 2, d_model)
+        # 条件投影: 文本特征(text_dim) + 场景特征(d_model) → d_model
+        self.cond_proj = nn.Linear(text_dim + d_model, d_model * 2)
+
+        # 条件融合后的投影
+        self.cond_fusion = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
 
         # Transformer Encoder
         encoder_layer = nn.TransformerEncoderLayer(
@@ -154,16 +167,17 @@ class DiffusionTrajectoryModel(nn.Module):
     # ============================================================
 
     def forward(self, x_t: torch.Tensor, t: torch.Tensor,
-                cond: torch.Tensor,
+                txt_feat: torch.Tensor, scene_map: torch.Tensor,
                 fixed_mask: Optional[torch.Tensor] = None
                 ) -> torch.Tensor:
         """预测噪声.
 
         Args:
-            x_t:  [B, L, 2] 加噪轨迹
-            t:    [B] 扩散时间步
-            cond: [B, d_model*2] 条件特征 (文本+场景)
-            fixed_mask: [B, L, 2] 固定点mask (起点+终点)
+            x_t:       [B, L, 2] 加噪轨迹
+            t:         [B] 扩散时间步
+            txt_feat:  [B, text_dim] 文本条件特征 (LLM决策BGE编码)
+            scene_map: [B, 3, 64, 64] 场景占用图
+            fixed_mask:[B, L, 2] 固定点mask (起点+终点)
 
         Returns:
             epsilon_pred: [B, L, 2] 预测的噪声
@@ -178,9 +192,11 @@ class DiffusionTrajectoryModel(nn.Module):
         t_feat = self.time_mlp(t_emb)  # [B, d_model]
         h = h + t_feat.unsqueeze(1)
 
-        # 条件注入 (通过 Add, 简化版Cross-Attn)
-        cond_feat = self.cond_proj(cond)  # [B, d_model]
-        h = h + cond_feat.unsqueeze(1)
+        # 条件编码: 场景 + 文本
+        scn_feat = self.scene_encoder(scene_map)          # [B, d_model]
+        cond = self.cond_proj(torch.cat([txt_feat, scn_feat], dim=-1))  # [B, d_model*2]
+        cond = self.cond_fusion(cond)  # [B, d_model]
+        h = h + cond.unsqueeze(1)
 
         # Transformer
         h = self.transformer(h)  # [B, L, d_model]
@@ -198,14 +214,16 @@ class DiffusionTrajectoryModel(nn.Module):
     # 训练 loss
     # ============================================================
 
-    def training_loss(self, x_0: torch.Tensor, cond: torch.Tensor,
+    def training_loss(self, x_0: torch.Tensor,
+                      txt_feat: torch.Tensor, scene_map: torch.Tensor,
                       fixed_mask: Optional[torch.Tensor] = None
                       ) -> torch.Tensor:
         """计算扩散训练 loss.
 
         Args:
-            x_0:  [B, L, 2] 真实轨迹
-            cond: [B, d_model*2] 条件特征
+            x_0:       [B, L, 2] 真实轨迹
+            txt_feat:  [B, text_dim] 文本条件
+            scene_map: [B, 3, 64, 64] 场景占用图
 
         Returns:
             loss: scalar MSE loss
@@ -225,7 +243,7 @@ class DiffusionTrajectoryModel(nn.Module):
               torch.sqrt(1.0 - alpha_cumprod_t) * epsilon
 
         # 预测噪声
-        epsilon_pred = self.forward(x_t, t, cond, fixed_mask)
+        epsilon_pred = self.forward(x_t, t, txt_feat, scene_map, fixed_mask)
 
         # MSE loss
         loss = nn.functional.mse_loss(epsilon_pred, epsilon)
@@ -236,7 +254,7 @@ class DiffusionTrajectoryModel(nn.Module):
     # ============================================================
 
     @torch.no_grad()
-    def generate(self, cond: torch.Tensor,
+    def generate(self, txt_feat: torch.Tensor, scene_map: torch.Tensor,
                  start: torch.Tensor, target: torch.Tensor,
                  num_steps: int = 31,
                  num_inference_steps: Optional[int] = None,
@@ -244,60 +262,58 @@ class DiffusionTrajectoryModel(nn.Module):
         """从噪声生成轨迹 (DDIM 采样).
 
         Args:
-            cond:     [B, d_model*2] 条件特征
-            start:    [B, 2] 起点坐标
-            target:   [B, 2] 目标坐标
+            txt_feat:  [B, text_dim] 文本条件
+            scene_map: [B, 3, 64, 64] 场景占用图
+            start:     [B, 2] 起点坐标
+            target:    [B, 2] 目标坐标
             num_steps: int 轨迹长度
-            num_inference_steps: int DDIM采样步数 (默认100, 越小越快)
+            num_inference_steps: int DDIM采样步数 (默认100)
 
         Returns:
             trajectory: [B, num_steps, 2]
         """
-        B = cond.shape[0]
+        B = txt_feat.shape[0]
         num_inf = num_inference_steps or self.num_inference_steps
 
         # 固定点 mask
-        fixed_mask = torch.zeros(B, num_steps, 2, device=cond.device)
+        fixed_mask = torch.zeros(B, num_steps, 2, device=txt_feat.device)
         fixed_mask[:, 0, :] = 1.0
         fixed_mask[:, -1, :] = 1.0
 
         # 初始噪声
-        x_t = torch.randn(B, num_steps, 2, device=cond.device)
+        x_t = torch.randn(B, num_steps, 2, device=txt_feat.device)
         x_t[:, 0, :] = start
         x_t[:, -1, :] = target
 
         # DDIM 时间步 (均匀间隔)
         timesteps = torch.linspace(
-            self.num_timesteps - 1, 0, num_inf, dtype=torch.long, device=cond.device
+            self.num_timesteps - 1, 0, num_inf, dtype=torch.long, device=txt_feat.device
         )
 
         for i in range(len(timesteps) - 1):
             t = timesteps[i]
             t_next = timesteps[i + 1]
 
-            t_batch = torch.full((B,), t, device=cond.device, dtype=torch.long)
+            t_batch = torch.full((B,), t, device=txt_feat.device, dtype=torch.long)
 
             # 预测噪声
-            eps_pred = self.forward(x_t, t_batch, cond, fixed_mask)
+            eps_pred = self.forward(x_t, t_batch, txt_feat, scene_map, fixed_mask)
 
             # DDIM 更新
             alpha_t = self.alphas_cumprod[t]
             alpha_next = self.alphas_cumprod[t_next]
 
-            # x0 预测
             x0_pred = (x_t - torch.sqrt(1.0 - alpha_t) * eps_pred) / \
                       torch.sqrt(alpha_t)
 
-            # 方向指向 x0
             dir_xt = torch.sqrt(1.0 - alpha_next) * eps_pred
 
-            # 更新
             x_t = torch.sqrt(alpha_next) * x0_pred + dir_xt
 
             # 固定点约束
             x_t = x_t * (1.0 - fixed_mask) + \
                   torch.cat([start.unsqueeze(1),
-                             torch.zeros(B, num_steps - 2, 2, device=cond.device),
+                             torch.zeros(B, num_steps - 2, 2, device=txt_feat.device),
                              target.unsqueeze(1)], dim=1) * fixed_mask
 
         return x_t  # [B, num_steps, 2]
@@ -381,7 +397,7 @@ class DiffusionPolicy:
               f"d_model={self.d_model}, layers={self.num_layers}")
 
     def encode_text(self, text: str) -> torch.Tensor:
-        """LLM决策文本 → 特征向量."""
+        """LLM决策文本 → 特征向量 [1, text_dim]."""
         if self.text_encoder is None or not text:
             return torch.zeros(1, self._text_dim).cuda()
 
@@ -391,16 +407,21 @@ class DiffusionPolicy:
 
         with torch.no_grad():
             output = self.text_encoder(**tokens)
-            # CLS token 或 mean pooling
-            emb = output.last_hidden_state[:, 0, :]  # [1, 768]
+            emb = output.last_hidden_state[:, 0, :]  # [1, text_dim]
         return emb
 
     def encode_scene(self, scene_map: np.ndarray) -> torch.Tensor:
-        """场景占用图 → 特征向量."""
+        """场景占用图 → tensor [1, 3, 64, 64].
+
+        build_scene_map 返回 [H, W, C] → 转为 [B, C, H, W] (NCHW).
+        """
         if scene_map.ndim == 3:
-            scene_map = scene_map[np.newaxis, ...]
-        x = torch.tensor(scene_map, dtype=torch.float32).cuda()
-        return self.model.scene_encoder(x)  # 使用模型内置编码器
+            scene_map = scene_map[np.newaxis, ...]  # [1, H, W, C]
+        # permute: [B, H, W, C] → [B, C, H, W]
+        t = torch.tensor(scene_map, dtype=torch.float32)
+        if t.ndim == 4 and t.shape[-1] == 3:
+            t = t.permute(0, 3, 1, 2)
+        return t.cuda()
 
     @torch.no_grad()
     def generate_one(self, start: np.ndarray, target: np.ndarray,
@@ -419,28 +440,21 @@ class DiffusionPolicy:
             [num_steps, 2] numpy 轨迹
         """
         if self.model is None:
-            # Fallback: 线性插值
             return np.linspace(start, target, num_steps)
 
         self.model.eval()
 
-        # 编码条件
-        txt_feat = self.encode_text(llm_reasoning)  # [1, 768]
-        scn_feat = self.encode_scene(scene_map)      # [1, d_model]
-        cond = torch.cat([txt_feat, scn_feat], dim=-1)  # [1, 768+d_model]
-
-        # 对齐维度
-        if cond.shape[-1] != self.d_model * 2:
-            cond = torch.nn.functional.pad(
-                cond, (0, self.d_model * 2 - cond.shape[-1])
-            )
+        # 编码文本条件
+        txt_feat = self.encode_text(llm_reasoning)  # [1, text_dim]
+        # 场景图直接传 tensor, 编码由 model 内部完成
+        scene_t = self.encode_scene(scene_map)       # [1, 3, 64, 64]
 
         start_t = torch.tensor(start, dtype=torch.float32).unsqueeze(0).cuda()
         target_t = torch.tensor(target, dtype=torch.float32).unsqueeze(0).cuda()
 
-        # 生成
         traj = self.model.generate(
-            cond=cond,
+            txt_feat=txt_feat,
+            scene_map=scene_t,
             start=start_t,
             target=target_t,
             num_steps=num_steps,
@@ -454,26 +468,23 @@ class DiffusionPolicy:
         """批量生成 (更高效)."""
         B = len(starts)
 
-        # 编码所有条件
         txt_feats = torch.cat([
             self.encode_text(r) for r in reasonings
-        ], dim=0)  # [B, 768]
+        ], dim=0)  # [B, text_dim]
 
-        scn_feats = torch.cat([
+        scene_ts = torch.cat([
             self.encode_scene(m) for m in scene_maps
-        ], dim=0)  # [B, d_model]
-
-        cond = torch.cat([txt_feats, scn_feats], dim=-1)
-        if cond.shape[-1] != self.d_model * 2:
-            cond = torch.nn.functional.pad(
-                cond, (0, self.d_model * 2 - cond.shape[-1])
-            )
+        ], dim=0)  # [B, 3, 64, 64]
 
         start_t = torch.tensor(np.array(starts), dtype=torch.float32).cuda()
         target_t = torch.tensor(np.array(targets), dtype=torch.float32).cuda()
 
         trajs = self.model.generate(
-            cond=cond, start=start_t, target=target_t, num_steps=num_steps
+            txt_feat=txt_feats,
+            scene_map=scene_ts,
+            start=start_t,
+            target=target_t,
+            num_steps=num_steps,
         )
 
         return trajs.cpu().numpy()  # [B, 31, 2]
@@ -514,12 +525,12 @@ def build_scene_map(agent_position, env_snapshot, resolution=64):
                 if (wx - cx)**2 + (wy - cy)**2 < r**2:
                     scene[i, j, 0] = 1.0
 
-    # Channel 1: 烟雾 (从grid降采样)
+    # Channel 1: 烟雾 (从grid降采样，加边界保护)
     grid = env_snapshot.grid
     for i in range(H):
         for j in range(W):
-            gr = int(i / H * grid.shape[0])
-            gc = int(j / W * grid.shape[1])
+            gr = min(int(i / H * grid.shape[0]), grid.shape[0] - 1)
+            gc = min(int(j / W * grid.shape[1]), grid.shape[1] - 1)
             scene[i, j, 1] = grid[gr, gc, 0]
 
     # Channel 2: 出口

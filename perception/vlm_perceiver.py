@@ -60,8 +60,6 @@ class VLMPerceiver:
         # 缓存
         self.last_description: str = ""
         self.last_call_tick: int = -999999
-        self._last_smoke_max: float = 0.0
-        self._last_fire_cells: int = 0
         self._call_count: int = 0
 
         # 统计
@@ -151,27 +149,8 @@ class VLMPerceiver:
     # ================================================================
 
     def _should_call(self, tick: int, env_snapshot=None) -> bool:
-        """判断是否需要重新调用 VLM."""
-        # 定时触发
-        if tick - self.last_call_tick >= self.call_interval:
-            return True
-
-        # 环境剧变触发
-        if env_snapshot is not None:
-            current_smoke = float(env_snapshot.grid[:, :, 0].max())
-            current_fire = int((env_snapshot.grid[:, :, 3] > 0.5).sum())
-
-            if current_smoke - self._last_smoke_max > 0.2:
-                self._last_smoke_max = current_smoke
-                return True
-            if current_fire - self._last_fire_cells > 5:
-                self._last_fire_cells = current_fire
-                return True
-
-            self._last_smoke_max = current_smoke
-            self._last_fire_cells = current_fire
-
-        return False
+        """判断是否需要重新调用 VLM (当前仅定时触发)."""
+        return tick - self.last_call_tick >= self.call_interval
 
     def _call_vlm(self, frame: np.ndarray) -> str:
         """执行一次 VLM 推理."""

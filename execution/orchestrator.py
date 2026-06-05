@@ -18,8 +18,10 @@ from typing import List, Dict, Optional
 from decision.agent_state import Agent, AgentProfile, AgentDynamic, Speed, Cooperation
 from decision.cognitive_engine import LLMCognitiveEngine, DecisionResult
 from decision.knowledge_base import DisasterKnowledgeBase
+from decision.safety_guard import SafetyGuard
 from perception.environment import DisasterSimulator, EnvironmentSnapshot
 from execution.batched_physics import BatchedPhysics
+from execution.diffusion_policy import build_scene_map
 from group_intel.propagation import GroupIntelligence
 
 
@@ -74,6 +76,9 @@ class SimulationOrchestrator:
         # Group intelligence
         self.group_intel = GroupIntelligence(width=self.width, height=self.height)
 
+        # Safety guard (hard constraints on LLM output)
+        self.safety_guard = SafetyGuard()
+
         # Agents
         self.agents: List[Agent] = []
         self.agent_cfg = agent_cfg
@@ -85,6 +90,8 @@ class SimulationOrchestrator:
         self.casualty_count = 0
         self.decision_count = 0
         self.total_llm_time = 0.0
+        self.safety_blocks = 0       # Count of LLM decisions blocked by safety guard
+        self.safety_modifications = 0  # Count of decisions modified by safety guard
 
     # ================================================================
     # Agent Generation
@@ -230,8 +237,9 @@ class SimulationOrchestrator:
         self.generate_agents()
         self.llm_engine.initialize()
 
-        # v2: VLM 感知器
+        # v2: VLM 感知器 + YOLO 检测器 (双通道)
         self.vlm = None
+        self.yolo = None
         if self.use_vlm:
             from perception.vlm_perceiver import VLMPerceiver
             self.vlm = VLMPerceiver(
@@ -239,6 +247,18 @@ class SimulationOrchestrator:
                 call_interval=self.cfg["vlm"].get("call_interval", 30),
             )
             self.vlm.initialize()
+
+            # YOLO 检测通道 (与VLM互补)
+            from perception.yolo_detector import YOLODetector
+            self.yolo = YOLODetector(
+                model_name=self.cfg.get("yolo", {}).get("model", "yolov8n.pt"),
+                confidence_threshold=self.cfg.get("yolo", {}).get("conf_threshold", 0.35),
+            )
+            self.yolo.initialize()
+            self.yolo.set_calibration(
+                img_w=640, img_h=480,
+                world_w=self.width, world_h=self.height,
+            )
 
         # v2: 扩散模型轨迹生成
         self.diffusion_policy = None
@@ -303,13 +323,17 @@ class SimulationOrchestrator:
             if decisions:
                 self.decision_count += len(decisions)  # Only count actual results
                 self.total_llm_time += sum(d.compute_time for d in decisions.values())
-                self._apply_decisions(decisions)
+                self._apply_decisions(decisions, env_snapshot)
 
-            # ---- 3.5 VLM Perception (v2.0) ----
-            vlm_description = ""
+            # ---- 3.5 VLM + YOLO 双通道感知 (v2.0) ----
             if self.vlm is not None and self.tick % self.vlm.call_interval == 0:
-                frame = self._render_cctv_frame()  # 渲染当前场景为RGB
-                vlm_description = self.vlm.perceive(frame, self.tick, env_snapshot)
+                frame = self._render_cctv_frame()
+                # 通道A: VLM 语义理解
+                vlm_desc = self.vlm.perceive(frame, self.tick, env_snapshot)
+                # 通道B: YOLO 人员检测
+                yolo_res = self.yolo.detect(frame) if self.yolo is not None else None
+                # 只在有新数据时更新 LLM 引擎的感知上下文 (持久化缓存)
+                self.llm_engine.set_perception_context(vlm_desc, yolo_res)
 
             # ---- 4. Group Intelligence ----
             self.group_intel.propagate(
@@ -351,7 +375,8 @@ class SimulationOrchestrator:
                       f"Alive: {self.num_agents - self.evacuated_count - self.casualty_count:4d} | "
                       f"Evac: {self.evacuated_count:4d} | "
                       f"Dead: {self.casualty_count:4d} | "
-                      f"Decisions: {self.decision_count:5d}")
+                      f"LLM: {self.decision_count:5d} | "
+                      f"Blocked: {self.safety_blocks:3d}/{self.safety_modifications:3d}")
 
             # ---- 9. Termination check ----
             remaining = self.num_agents - self.evacuated_count - self.casualty_count
@@ -367,29 +392,98 @@ class SimulationOrchestrator:
         if vis:
             vis.close()
 
+        # v2.0 模块清理
+        if self.vlm is not None:
+            self.vlm.shutdown()
+        if self.yolo is not None:
+            self.yolo.shutdown()
+        if self.diffusion_policy is not None:
+            self.diffusion_policy.shutdown()
+
         self.llm_engine.shutdown()
         self._print_summary(tick_times)
 
-    def _apply_decisions(self, decisions: Dict[str, DecisionResult]):
-        """Apply LLM decisions to agent states."""
+    def _apply_decisions(self, decisions: Dict[str, DecisionResult],
+                         env_snapshot=None):
+        """Apply LLM decisions to agent states, with safety guard filtering."""
         for agent in self.agents:
-            if agent.id in decisions:
-                d = decisions[agent.id]
-                agent.dynamic.target_exit = np.array(d.target_exit_pos, dtype=np.float64)
-                agent.dynamic.speed_choice = d.speed
-                agent.dynamic.cooperation_choice = d.cooperation
-                agent.dynamic.reasoning_text = d.reasoning
-                agent.dynamic.last_decision_tick = self.tick
-                agent.dynamic.has_new_info = False
+            if agent.id not in decisions:
+                continue
 
-                # Add to memory
-                agent.dynamic.memory_events.append({
-                    "time": f"{self.sim_time:.0f}s",
-                    "desc": f"决定前往出口{d.target_exit_idx+1}: {d.reasoning[:60]}",
-                    "credibility": 0.95,
-                })
-                if len(agent.dynamic.memory_events) > 20:
-                    agent.dynamic.memory_events = agent.dynamic.memory_events[-20:]
+            d = decisions[agent.id]
+            safety = None
+
+            # --- Safety guard check ---
+            if env_snapshot is not None:
+                safety = self.safety_guard.check(d, agent, env_snapshot)
+
+                if not safety.passed:
+                    # Decision blocked — use safety fallback
+                    self.safety_blocks += 1
+                    fb = self.safety_guard.fallback_decision(agent, env_snapshot)
+                    target_exit = np.array(fb["target_exit_pos"], dtype=np.float64)
+                    speed = fb["speed"]
+                    cooperation = fb["cooperation"]
+                    reasoning = fb["reasoning"]
+                    target_idx = fb["target_exit_idx"]
+                    agent.dynamic.memory_events.append({
+                        "time": f"{self.sim_time:.0f}s",
+                        "desc": f"⛔ 决策被安全约束拦截: {safety.block_reason}",
+                        "credibility": 1.0,
+                    })
+                elif safety.modified:
+                    # Decision modified — apply corrected version
+                    self.safety_modifications += 1
+                    target_exit = np.array(
+                        env_snapshot.exits[safety.final_exit_idx],
+                        dtype=np.float64
+                    )
+                    speed = Speed(safety.final_speed)
+                    cooperation = d.cooperation
+                    reasoning = d.reasoning
+                    target_idx = safety.final_exit_idx
+                    for w in safety.warnings:
+                        agent.dynamic.memory_events.append({
+                            "time": f"{self.sim_time:.0f}s",
+                            "desc": f"⚠ 安全修正: {w}",
+                            "credibility": 1.0,
+                        })
+                else:
+                    # Clean — apply original
+                    target_exit = np.array(d.target_exit_pos, dtype=np.float64)
+                    speed = d.speed
+                    cooperation = d.cooperation
+                    reasoning = d.reasoning
+                    target_idx = d.target_exit_idx
+            else:
+                # No env snapshot — apply as-is
+                target_exit = np.array(d.target_exit_pos, dtype=np.float64)
+                speed = d.speed
+                cooperation = d.cooperation
+                reasoning = d.reasoning
+                target_idx = d.target_exit_idx
+
+            # Apply final decision to agent
+            agent.dynamic.target_exit = target_exit
+            agent.dynamic.speed_choice = speed
+            agent.dynamic.cooperation_choice = cooperation
+            agent.dynamic.reasoning_text = reasoning
+            agent.dynamic.last_decision_tick = self.tick
+            agent.dynamic.has_new_info = False
+
+            # Record decision in memory (always, regardless of safety outcome)
+            safety_tag = ""
+            if safety is not None and not safety.passed:
+                safety_tag = " [安全约束兜底]"
+            agent.dynamic.memory_events.append({
+                "time": f"{self.sim_time:.0f}s",
+                "desc": f"决定前往出口{target_idx+1}{safety_tag}: {reasoning[:60]}",
+                "credibility": 0.95 if (safety is None or safety.passed) else 0.7,
+            })
+
+            # Trim memory
+            if len(agent.dynamic.memory_events) > 20:
+                agent.dynamic.memory_events = agent.dynamic.memory_events[-20:]
 
     def _get_broadcast(self) -> str:
         """Generate official broadcast messages at specific times."""
@@ -407,7 +501,6 @@ class SimulationOrchestrator:
 
     def _step_diffusion(self, env_snapshot):
         """v2.0: 播放预生成的扩散轨迹, 需要时重新生成."""
-        from execution.diffusion_policy import build_scene_map
 
         for agent in self.agents:
             if agent.dynamic.evacuated or not agent.dynamic.alive:
@@ -513,6 +606,8 @@ class SimulationOrchestrator:
         print(f"  Casualties:       {self.casualty_count} "
               f"({self.casualty_count/self.num_agents*100:.1f}%)")
         print(f"  LLM decisions:    {self.decision_count}")
+        print(f"  Safety blocked:   {self.safety_blocks}")
+        print(f"  Safety modified:  {self.safety_modifications}")
         avg_llm = (self.total_llm_time / self.decision_count * 1000
                    if self.decision_count > 0 else 0)
         print(f"  Avg LLM latency:  {avg_llm:.0f}ms/decision")

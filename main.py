@@ -6,7 +6,7 @@ Usage:
     python main.py                        # Default config
     python main.py --config my_conf.yaml  # Custom config
     python main.py --no-viz               # Headless mode
-    python main.py --batch-test           # Run multiple configs
+    python main.py --web --port 8080      # Web visualization (GPU cloud)
 """
 
 import argparse
@@ -47,7 +47,26 @@ def main():
         "--model", "-m", type=str, default=None,
         help="Override LLM model name"
     )
+    parser.add_argument(
+        "--web", action="store_true",
+        help="Launch web visualization server (for GPU cloud platforms)"
+    )
+    parser.add_argument(
+        "--port", "-p", type=int, default=8080,
+        help="Web server port (default: 8080)"
+    )
     args = parser.parse_args()
+
+    # --- Web 模式: 启动 Flask 服务器 ---
+    if args.web:
+        from visualization.web_server import start_server
+        start_server(
+            config_path=args.config,
+            num_agents=args.agents,
+            port=args.port,
+            frame_interval=args.frame_interval,
+        )
+        return
 
     # Build orchestrator
     orchestrator = SimulationOrchestrator(config_path=args.config)

@@ -71,6 +71,10 @@ vlm:
   model: "Qwen/Qwen2.5-VL-7B-Instruct-AWQ"   # 开发: AWQ, 实验: FP16
   call_interval: 30                            # 每N tick调用一次
 
+yolo:
+  model: "yolov8n.pt"                          # YOLO 检测模型
+  conf_threshold: 0.35                         # 检测置信度阈值
+
 diffusion:
   enabled: false
   d_model: 256
@@ -78,5 +82,3 @@ diffusion:
   num_layers: 6
   num_inference_steps: 100
   checkpoint: "./checkpoints/diffusion_final.pt"
-
-trajectory_mode: "social_force"  # "social_force" | "diffusion"

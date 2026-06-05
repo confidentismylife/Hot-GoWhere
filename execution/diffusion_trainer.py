@@ -33,9 +33,8 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from execution.diffusion_policy import (
-    DiffusionTrajectoryModel, SceneMapEncoder, build_scene_map
+    DiffusionTrajectoryModel, build_scene_map
 )
-from execution.orchestrator import SimulationOrchestrator
 
 
 # ================================================================
@@ -83,30 +82,38 @@ class TrajectoryDataset(Dataset):
 
 
 class TrajectoryBatcher:
-    """自定义 batch 整理, 处理变长文本."""
+    """自定义 batch 整理, 处理变长文本.
+
+    v2.0: 匹配 DiffusionTrajectoryModel 新 API — 分别传 txt_feat + scene_map.
+    """
 
     def __init__(self, text_encoder, device="cuda"):
         self.text_encoder = text_encoder
         self.device = device
+
+        # 缓存 tokenizer, 避免每次 batch 都从磁盘加载
+        if text_encoder is not None:
+            from transformers import AutoTokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-base-zh-v1.5")
+        else:
+            self.tokenizer = None
 
     def __call__(self, samples: List[dict]) -> dict:
         B = len(samples)
 
         starts   = torch.stack([s["start"] for s in samples])
         targets  = torch.stack([s["target"] for s in samples])
-        cond_map = torch.stack([s["cond_map"] for s in samples])
         trajs    = torch.stack([s["traj"] for s in samples])
 
+        # 场景占用图: list of [H,W,3] → [B,3,H,W]
+        cond_maps = torch.stack([s["cond_map"] for s in samples])
+        if cond_maps.ndim == 4 and cond_maps.shape[-1] == 3:
+            cond_maps = cond_maps.permute(0, 3, 1, 2)  # [B,H,W,3] → [B,3,H,W]
+
         # 编码文本
-        texts = [s["cond_txt"] for s in samples]
+        texts = [s["cond_txt"] or "向前移动" for s in samples]
         with torch.no_grad():
             txt_feats = self._encode_texts(texts)  # [B, 768]
-
-        # 场景编码 (用内置编码器)
-        scn_feats = self._encode_scenes(cond_map)  # [B, d_model]
-
-        # 拼接条件
-        cond = torch.cat([txt_feats, scn_feats], dim=-1)
 
         # 固定点mask (起点+终点)
         L = trajs.shape[1]
@@ -116,29 +123,20 @@ class TrajectoryBatcher:
 
         return {
             "x_0": trajs.to(self.device),
-            "cond": cond.to(self.device),
+            "txt_feat": txt_feats.to(self.device),
+            "scene_map": cond_maps.to(self.device),
             "fixed_mask": fixed_mask.to(self.device),
         }
 
     def _encode_texts(self, texts):
-        if self.text_encoder is None:
+        if self.text_encoder is None or self.tokenizer is None:
             return torch.zeros(len(texts), 768)
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-base-zh-v1.5")
-        tokens = tokenizer(texts, return_tensors="pt", padding=True,
-                          truncation=True, max_length=256)
+        tokens = self.tokenizer(texts, return_tensors="pt", padding=True,
+                              truncation=True, max_length=256)
         tokens = {k: v.to(self.device) for k, v in tokens.items()}
         with torch.no_grad():
             out = self.text_encoder(**tokens)
         return out.last_hidden_state[:, 0, :]
-
-    def _encode_scenes(self, cond_map):
-        # 轻量降采样
-        B = cond_map.shape[0]
-        pooled = nn.functional.adaptive_avg_pool2d(
-            cond_map.permute(0, 3, 1, 2), (8, 8)
-        )
-        return pooled.reshape(B, -1).to(self.device)
 
 
 # ================================================================
@@ -152,31 +150,30 @@ class DiffusionTrainer:
         self.cfg = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # 模型
+        # 模型 (内置 scene_encoder + 条件融合)
         self.model = DiffusionTrajectoryModel(
             d_model=config.get("d_model", 256),
             nhead=config.get("nhead", 8),
             num_layers=config.get("num_layers", 6),
             num_inference_steps=config.get("num_inference_steps", 100),
+            text_dim=768,
         ).to(self.device)
 
-        self.scene_encoder = SceneMapEncoder(
-            d_model=config.get("d_model", 256)
-        ).to(self.device)
-
-        # 文本编码器
+        # 文本编码器 (frozen)
         try:
             from transformers import AutoModel
             self.text_encoder = AutoModel.from_pretrained(
                 "BAAI/bge-base-zh-v1.5"
             ).to(self.device)
             self.text_encoder.eval()
+            for p in self.text_encoder.parameters():
+                p.requires_grad = False
         except Exception:
             self.text_encoder = None
 
-        # 优化器
+        # 优化器 (只训练扩散模型)
         self.optimizer = AdamW(
-            list(self.model.parameters()) + list(self.scene_encoder.parameters()),
+            self.model.parameters(),
             lr=config.get("lr", 1e-4),
             weight_decay=config.get("weight_decay", 1e-5),
         )
@@ -189,15 +186,14 @@ class DiffusionTrainer:
 
     def train_epoch(self, dataloader, epoch: int) -> dict:
         self.model.train()
-        self.scene_encoder.train()
 
         total_loss = 0.0
         n_batches = 0
 
         for batch in dataloader:
-            # batch 已经在 batcher 中处理好了
             loss = self.model.training_loss(
-                batch["x_0"], batch["cond"], batch["fixed_mask"]
+                batch["x_0"], batch["txt_feat"],
+                batch["scene_map"], batch["fixed_mask"]
             )
 
             self.optimizer.zero_grad()
@@ -217,14 +213,12 @@ class DiffusionTrainer:
     def evaluate(self, dataloader) -> dict:
         """评估: ADE (Average Displacement Error) 和 FDE (Final Displacement Error)."""
         self.model.eval()
-        self.scene_encoder.eval()
 
         ade_sum = 0.0
         fde_sum = 0.0
         n = 0
 
         for batch in dataloader:
-            # 用 inference 模式生成轨迹
             B = batch["x_0"].shape[0]
             L = batch["x_0"].shape[1]
 
@@ -232,7 +226,8 @@ class DiffusionTrainer:
             targets = batch["x_0"][:, -1, :]
 
             pred = self.model.generate(
-                cond=batch["cond"],
+                txt_feat=batch["txt_feat"],
+                scene_map=batch["scene_map"],
                 start=starts,
                 target=targets,
                 num_steps=L,
@@ -255,7 +250,6 @@ class DiffusionTrainer:
     def save_checkpoint(self, path: str):
         torch.save({
             "model": self.model.state_dict(),
-            "scene_encoder": self.scene_encoder.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(),
         }, path)
@@ -264,9 +258,9 @@ class DiffusionTrainer:
     def load_checkpoint(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
         self.model.load_state_dict(ckpt["model"])
-        self.scene_encoder.load_state_dict(ckpt["scene_encoder"])
         if "optimizer" in ckpt:
             self.optimizer.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
             self.scheduler.load_state_dict(ckpt["scheduler"])
         print(f"[Trainer] Checkpoint loaded: {path}")
 
@@ -281,57 +275,106 @@ def generate_training_data(config_path: str, output_dir: str,
     print(f"[DataGen] Generating {num_trajectories} trajectories...")
     os.makedirs(output_dir, exist_ok=True)
 
-    orch = SimulationOrchestrator(config_path)
-    orch.num_agents = 50  # 少量Agent, 多次跑
+    from perception.environment import DisasterSimulator, EnvironmentSnapshot
+    from execution.batched_physics import BatchedPhysics
+
+    jsonl_path = os.path.join(output_dir, "trajectories.jsonl")
     total_generated = 0
     run_id = 0
 
-    jsonl_path = os.path.join(output_dir, "trajectories.jsonl")
+    # 使用 SimulationOrchestrator 的简化版本
+    from decision.agent_state import Agent, AgentProfile, AgentDynamic, Speed
+    import random
+
     with open(jsonl_path, 'w', encoding='utf-8') as f_out:
-
         while total_generated < num_trajectories:
-            orch.tick = 0
-            orch.sim_time = 0.0
-            orch.generate_agents()
-
-            # 跑一次短仿真 (60秒)
-            while orch.tick < 600 and (total_generated < num_trajectories):
-                orch.disaster.step(orch.dt)
-                orch.spatial_grid.rebuild(orch.agents)
-                orch.physics.step_all(orch.agents, orch.dt)
-
-                # 每30 tick 采样一次轨迹片段
-                if orch.tick % 30 == 0:
-                    for agent in orch.agents:
-                        if not agent.dynamic.alive or agent.dynamic.evacuated:
-                            continue
-                        # 取最近3秒的轨迹
-                        if hasattr(agent, 'position_history') and \
-                           len(agent.position_history) >= 31:
-                            record = {
-                                "start": agent.position_history[-31].tolist(),
-                                "target": agent.dynamic.target_exit.tolist()
-                                          if agent.dynamic.target_exit
-                                          is not None else [50, 30],
-                                "llm_decision": agent.dynamic.reasoning_text or "",
-                                "scene_map": build_scene_map(
-                                    agent.position,
-                                    orch.disaster.snapshot(
-                                        orch.tick, orch.sim_time,
-                                        orch.exits, orch.obstacles
-                                    )
-                                ).tolist(),
-                                "trajectory": agent.position_history[-31:],
-                            }
-                            f_out.write(json.dumps(record, ensure_ascii=False) + "\n")
-                            total_generated += 1
-                            if total_generated >= num_trajectories:
-                                break
-
-                orch.tick += 1
-                orch.sim_time += orch.dt
-
             run_id += 1
+            random.seed(run_id)
+            np.random.seed(run_id)
+
+            import yaml
+            with open(config_path, 'r', encoding='utf-8') as f_cfg:
+                cfg = yaml.safe_load(f_cfg)
+
+            env_cfg = cfg["environment"]
+
+            disaster = DisasterSimulator(
+                width=env_cfg["width"], height=env_cfg["height"],
+                disaster_type=env_cfg["disaster"],
+                origin=tuple(env_cfg["disaster_origin"]),
+                spread_rate=env_cfg["disaster_spread_rate"],
+                resolution=0.5,
+            )
+
+            exits = [tuple(e) for e in env_cfg["exit_positions"]]
+            obstacles = env_cfg.get("obstacles", [])
+
+            physics = BatchedPhysics(
+                width=env_cfg["width"], height=env_cfg["height"],
+                obstacles=obstacles,
+            )
+
+            agents = []
+            for i in range(50):
+                x = random.uniform(5, env_cfg["width"] - 5)
+                y = random.uniform(5, env_cfg["height"] - 5)
+                chosen_exit = random.choice(exits)
+                profile = AgentProfile(
+                    max_speed=random.uniform(0.8, 2.0),
+                    risk_aversion=random.uniform(0.2, 0.9),
+                    conformity=random.uniform(0.1, 0.9),
+                )
+                dynamic = AgentDynamic(
+                    position=np.array([x, y], dtype=np.float64),
+                    stamina=random.uniform(60, 100),
+                    target_exit=np.array(chosen_exit, dtype=np.float64),
+                    speed_choice=Speed.WALK,
+                    has_new_info=True,
+                )
+                agents.append(Agent(profile=profile, dynamic=dynamic))
+
+            # 位置历史跟踪
+            pos_history = {a.id: [] for a in agents}
+
+            dt = 0.1
+            for tick in range(600):
+                disaster.step(dt)
+                snapshot = disaster.snapshot(
+                    tick, tick * dt, exits, obstacles
+                )
+                physics.step_all(agents, dt)
+
+                # 跟踪位置
+                for a in agents:
+                    if a.dynamic.alive and not a.dynamic.evacuated:
+                        pos_history[a.id].append(a.position.copy())
+
+                # 每30 tick 采样
+                if tick % 30 == 0 and tick > 30:
+                    for a in agents:
+                        history = pos_history[a.id]
+                        if len(history) < 31:
+                            continue
+                        recent = np.array(history[-31:])
+                        record = {
+                            "start": recent[0].tolist(),
+                            "target": (a.dynamic.target_exit.tolist()
+                                       if a.dynamic.target_exit is not None
+                                       else [50.0, 30.0]),
+                            "llm_decision": a.dynamic.reasoning_text or "",
+                            "scene_map": build_scene_map(
+                                a.position, snapshot
+                            ).tolist(),
+                            "trajectory": recent.tolist(),
+                        }
+                        f_out.write(json.dumps(record, ensure_ascii=False) + "\n")
+                        total_generated += 1
+                        if total_generated >= num_trajectories:
+                            break
+
+                if total_generated >= num_trajectories:
+                    break
+
             print(f"  Run {run_id}: {total_generated}/{num_trajectories} samples")
 
     print(f"[DataGen] Done. {total_generated} trajectories → {jsonl_path}")
@@ -369,14 +412,15 @@ def main():
         generate_training_data(args.config, args.data_dir, args.num_trajectories)
 
     elif args.mode == "pretrain":
-        dataset = TrajectoryDataset(args.data_dir, max_samples=None)
-        dataloader = DataLoader(
-            dataset, batch_size=args.batch_size, shuffle=True,
-            collate_fn=TrajectoryBatcher(None), num_workers=4
-        )
         trainer = DiffusionTrainer(config)
         if args.checkpoint:
             trainer.load_checkpoint(args.checkpoint)
+
+        dataset = TrajectoryDataset(args.data_dir, max_samples=None)
+        dataloader = DataLoader(
+            dataset, batch_size=args.batch_size, shuffle=True,
+            collate_fn=trainer.batcher, num_workers=0
+        )
 
         for epoch in range(1, args.epochs + 1):
             metrics = trainer.train_epoch(dataloader, epoch)
@@ -391,18 +435,18 @@ def main():
         trainer.save_checkpoint("./checkpoints/diffusion_final.pt")
 
     elif args.mode == "finetune":
-        # 加载预训练权重 → 微调
-        dataset = TrajectoryDataset(args.data_dir, max_samples=None)
-        dataloader = DataLoader(
-            dataset, batch_size=args.batch_size // 2, shuffle=True,
-            collate_fn=TrajectoryBatcher(None), num_workers=2
-        )
         trainer = DiffusionTrainer(config)
         if args.checkpoint:
             trainer.load_checkpoint(args.checkpoint)
         else:
             print("[Finetune] Warning: no pretrained checkpoint, "
                   "training from scratch.")
+
+        dataset = TrajectoryDataset(args.data_dir, max_samples=None)
+        dataloader = DataLoader(
+            dataset, batch_size=args.batch_size // 2, shuffle=True,
+            collate_fn=trainer.batcher, num_workers=0
+        )
 
         for epoch in range(1, args.epochs + 1):
             metrics = trainer.train_epoch(dataloader, epoch)
@@ -411,14 +455,15 @@ def main():
         trainer.save_checkpoint("./checkpoints/diffusion_finetuned.pt")
 
     elif args.mode == "eval":
-        dataset = TrajectoryDataset(args.data_dir, max_samples=500)
-        dataloader = DataLoader(
-            dataset, batch_size=32, shuffle=False,
-            collate_fn=TrajectoryBatcher(None)
-        )
         trainer = DiffusionTrainer(config)
         if args.checkpoint:
             trainer.load_checkpoint(args.checkpoint)
+
+        dataset = TrajectoryDataset(args.data_dir, max_samples=500)
+        dataloader = DataLoader(
+            dataset, batch_size=32, shuffle=False,
+            collate_fn=trainer.batcher, num_workers=0
+        )
 
         results = trainer.evaluate(dataloader)
         print(f"\n  Evaluation Results:")

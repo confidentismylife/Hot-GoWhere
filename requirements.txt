@@ -17,6 +17,19 @@ sentence-transformers>=3.0.0
 pygame>=2.6.0
 matplotlib>=3.9.0
 
+# v2.0: VLM 视觉感知
+qwen-vl-utils>=0.0.8
+Pillow>=10.0.0
+
+# v2.0: YOLO 人员检测
+ultralytics>=8.3.0
+
+# v2.0: Web 可视化 (GPU 云平台)
+flask>=3.0.0
+
+# v2.0: 扩散模型训练
+imageio>=2.35.0
+
 # Utilities
 tqdm>=4.66.0
 orjson>=3.10.0

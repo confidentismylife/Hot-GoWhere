@@ -61,8 +61,11 @@ class LLMCognitiveEngine:
         self.prompt_manager = PromptManager()
         self._ready = False
 
+        # v2.0: 双通道感知上下文 (由 orchestrator 每 tick 更新)
+        self._vlm_description: str = ""
+        self._yolo_result = None
+
         # Async pipeline
-        self._pending: List[Tuple[Agent, EnvironmentSnapshot, str]] = []
         self._pending_agents: Dict[str, Tuple[Agent, EnvironmentSnapshot]] = {}
         self._results: Dict[str, DecisionResult] = {}
         self._inference_thread: Optional[threading.Thread] = None
@@ -98,14 +101,23 @@ class LLMCognitiveEngine:
         print(f"[CogEngine] Model loaded in {elapsed:.1f}s. "
               f"Ready for inference.")
 
+    def set_perception_context(self, vlm_description: str = "",
+                                yolo_result=None):
+        """v2.0: 设置双通道感知上下文, 供 Prompt 构建使用."""
+        self._vlm_description = vlm_description
+        self._yolo_result = yolo_result
+
     def _build_messages(self, agent: Agent, env: EnvironmentSnapshot,
                         knowledge_docs: List[str]) -> Tuple[list, str]:
         """Build chat messages. Returns (messages, group_key)."""
         system = self.prompt_manager.build_system(env.disaster_type, knowledge_docs)
-        user = self.prompt_manager.build_user(agent, env)
+        user = self.prompt_manager.build_user(
+            agent, env,
+            vlm_description=self._vlm_description,
+            yolo_result=self._yolo_result,
+        )
 
         # Group key: used by vLLM prefix caching
-        # Same system prompt → same prefix → cached
         group_key = env.disaster_type
 
         return [
@@ -151,6 +163,16 @@ class LLMCognitiveEngine:
 
         formatted_prompts = self.tokenizer.apply_chat_template(
             all_formatted, tokenize=False, add_generation_prompt=True)
+
+        # Guard: ensure formatted prompts are valid before launching thread
+        if not formatted_prompts or any(p is None for p in formatted_prompts):
+            print("[CogEngine] Skipping batch: malformed prompts detected, "
+                  "using fallback for all agents")
+            for agent in all_agents:
+                result = self._fallback_decision(agent, pending[0][1])
+                with self._inference_lock:
+                    self._results[agent.id] = result
+            return
 
         self._inference_thread = threading.Thread(
             target=self._run_inference,

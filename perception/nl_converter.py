@@ -2,9 +2,12 @@
 
 This is the critical "cross-modal alignment" module — it bridges the gap
 between numeric sensor grids and human-readable text that LLMs can reason about.
+
+v2.0: 支持三通道融合 — 数值传感器 + VLM语义 + YOLO结构化检测
 """
 
 import numpy as np
+from typing import Optional
 from perception.environment import EnvironmentSnapshot
 from decision.agent_state import Agent
 
@@ -142,11 +145,48 @@ class NLConverter:
 {description}
 """
 
+    @staticmethod
+    def yolo_context(yolo_result=None) -> str:
+        """v2.0: 将YOLO结构化检测结果格式化为Prompt段落.
+
+        Args:
+            yolo_result: YOLOResult 或 None
+        """
+        if yolo_result is None or yolo_result.person_count == 0:
+            return ""
+
+        lines = [f"[人群检测] 画面中检测到约{yolo_result.person_count}人"]
+
+        # 密度热点
+        if yolo_result.density_hotspots:
+            spots = yolo_result.density_hotspots[:3]
+            spot_strs = []
+            for s in spots:
+                cx, cy = s["center"]
+                spot_strs.append(
+                    f"({cx:.0f},{cy:.0f})附近约{s['count']}人聚集"
+                )
+            lines.append(f"  人群热点: {'; '.join(spot_strs)}")
+
+        # 异常事件
+        if yolo_result.abnormal_events:
+            for ev in yolo_result.abnormal_events:
+                lines.append(f"  ⚠ {ev}")
+
+        return "\n".join(lines)
+
     @classmethod
-    def full_context(cls, agent: Agent, env: EnvironmentSnapshot) -> str:
-        """Assemble complete NL context for one agent's LLM decision call."""
+    def full_context(cls, agent: Agent, env: EnvironmentSnapshot,
+                     vlm_description: str = "",
+                     yolo_result=None) -> str:
+        """Assemble complete NL context for one agent's LLM decision call.
+
+        v2.0: 支持三通道输入 — 数值 + VLM + YOLO.
+        """
         parts = [
             cls.environment_context(agent, env),
+            cls.vlm_context(vlm_description),
+            cls.yolo_context(yolo_result),
             cls.personal_context(agent),
             cls.memory_context(agent),
             cls.rumor_context(agent),

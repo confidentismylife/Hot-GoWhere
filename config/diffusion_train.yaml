@@ -1,0 +1,28 @@
+# 扩散模型轨迹生成器 — 训练配置
+# Usage: python execution/diffusion_trainer.py --config config/diffusion_train.yaml
+
+training:
+  num_epochs: 100
+  batch_size: 64
+  lr: 1.0e-4
+  warmup_steps: 1000
+  gradient_clip: 1.0
+  num_timesteps: 1000          # 训练噪声步数
+  num_inference_steps: 100     # DDIM 推理采样步数 (100=快, 1000=高质量)
+  trajectory_steps: 31         # 轨迹长度 (3秒 @ 10Hz)
+  log_interval: 50
+  save_interval: 1000
+  checkpoint_dir: "./checkpoints"
+
+model:
+  d_model: 256
+  nhead: 8
+  num_layers: 6
+  text_encoder: "BAAI/bge-base-zh-v1.5"  # 中文 BERT 做文本条件编码
+
+data:
+  data_dir: "./data/trajectories"
+  max_train_samples: null      # null = 全部
+  max_val_samples: 1000
+  eth_ucy_path: "./data/eth_ucy"          # 预训练用 (可选)
+  simulation_samples_target: 10000        # 仿真数据目标生成量

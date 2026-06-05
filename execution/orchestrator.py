@@ -82,6 +82,7 @@ class SimulationOrchestrator:
 
         # Agents
         self.agents: List[Agent] = []
+        self._agent_lookup: Dict[str, Agent] = {}  # O(1) lookup
         self.agent_cfg = agent_cfg
 
         # Stats
@@ -94,6 +95,8 @@ class SimulationOrchestrator:
         self.safety_blocks = 0       # Count of LLM decisions blocked by safety guard
         self.safety_modifications = 0  # Count of decisions modified by safety guard
         self._command_broadcasts = []  # Commander-generated broadcasts (injected into civilian prompts)
+        self._kb_cache: Dict[str, List[str]] = {}  # Cache KB queries
+        self._kb_cache_tick: int = -999
 
     # ================================================================
     # Agent Generation
@@ -113,6 +116,7 @@ class SimulationOrchestrator:
 
         # Create family groups
         self._create_family_groups()
+        self._rebuild_lookup()
 
         print(f"[Orchestrator] Generated {len(self.agents)} agents "
               f"across {self.width}×{self.height}m environment.")
@@ -311,6 +315,7 @@ class SimulationOrchestrator:
         print(f"[Orchestrator] Spawned {num_command_agents} command agents "
               f"(1 global, {len(self.exits)} area, "
               f"{firefighter_count} firefighter, {guide_count} guide)")
+        self._rebuild_lookup()
 
     def _build_command_context(self, agent: Agent,
                                env: EnvironmentSnapshot) -> str:
@@ -483,13 +488,16 @@ class SimulationOrchestrator:
             ]
 
             if agents_to_decide:
-                # Prepare knowledge docs for this batch
-                kdocs = self.knowledge_base.query(
-                    f"{self.cfg['environment']['disaster']}疏散决策",
-                    disaster_type=self.cfg['environment']['disaster'],
-                    top_k=3
-                )
-                kdocs_map = {self.cfg['environment']['disaster']: kdocs}
+                # Cache KB query (knowledge docs don't change mid-simulation)
+                if self.tick - self._kb_cache_tick > 30:
+                    self._kb_cache[self.cfg['environment']['disaster']] = \
+                        self.knowledge_base.query(
+                            f"{self.cfg['environment']['disaster']}疏散决策",
+                            disaster_type=self.cfg['environment']['disaster'],
+                            top_k=3)
+                    self._kb_cache_tick = self.tick
+                kdocs_map = {self.cfg['environment']['disaster']:
+                             self._kb_cache.get(self.cfg['environment']['disaster'], [])}
 
                 self.llm_engine.submit_batch(agents_to_decide, env_snapshot, kdocs_map)
             # ---- 3. Collect LLM results ----
@@ -552,11 +560,13 @@ class SimulationOrchestrator:
             else:
                 self.physics.step_all(self.agents, self.dt)
 
-            # ---- 6. Stats update ----
-            self.evacuated_count = sum(
-                1 for a in self.agents if a.dynamic.evacuated)
-            self.casualty_count = sum(
-                1 for a in self.agents if not a.dynamic.alive)
+            # ---- 6. Stats update (single pass) ----
+            evac = 0; dead = 0
+            for a in self.agents:
+                if a.dynamic.evacuated: evac += 1
+                elif not a.dynamic.alive: dead += 1
+            self.evacuated_count = evac
+            self.casualty_count = dead
 
             # ---- 7. Visualization ----
             if vis:
@@ -692,11 +702,12 @@ class SimulationOrchestrator:
                 agent.dynamic.memory_events = agent.dynamic.memory_events[-20:]
 
     def _find_agent(self, agent_id: str):
-        """Find agent by ID. Returns None if not found."""
-        for a in self.agents:
-            if a.id == agent_id:
-                return a
-        return None
+        """Find agent by ID. Returns None if not found. O(1) via lookup dict."""
+        return self._agent_lookup.get(agent_id)
+
+    def _rebuild_lookup(self):
+        """Rebuild agent ID → agent dict. Call after spawning agents."""
+        self._agent_lookup = {a.id: a for a in self.agents}
 
     def _apply_command_decisions(self, decisions: Dict[str, DecisionResult],
                                  env_snapshot: EnvironmentSnapshot):

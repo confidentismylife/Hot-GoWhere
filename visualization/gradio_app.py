@@ -241,12 +241,17 @@ def run_simulation_thread(config_path: str, num_agents: Optional[int] = None):
                      orch.tick - a.dynamic.last_decision_tick >= orch.decision_ticks))
             ]
             if agents_to_decide:
-                kdocs = orch.knowledge_base.query(
-                    f"{orch.cfg['environment']['disaster']}疏散决策",
-                    disaster_type=orch.cfg['environment']['disaster'], top_k=3)
+                # Cache KB query (knowledge docs don't change mid-simulation)
+                if orch.tick - orch._kb_cache_tick > 30:
+                    orch._kb_cache[orch.cfg['environment']['disaster']] = \
+                        orch.knowledge_base.query(
+                            f"{orch.cfg['environment']['disaster']}疏散决策",
+                            disaster_type=orch.cfg['environment']['disaster'], top_k=3)
+                    orch._kb_cache_tick = orch.tick
                 orch.llm_engine.submit_batch(
                     agents_to_decide, env_snapshot,
-                    {orch.cfg['environment']['disaster']: kdocs})
+                    {orch.cfg['environment']['disaster']:
+                     orch._kb_cache.get(orch.cfg['environment']['disaster'], [])})
 
             decisions = orch.llm_engine.collect_results()
             if decisions:
@@ -270,9 +275,14 @@ def run_simulation_thread(config_path: str, num_agents: Optional[int] = None):
             orch.group_intel.update_stamina(orch.agents, orch.dt)
             orch.physics.step_all(orch.agents, orch.dt)
 
-            orch.evacuated_count = sum(1 for a in orch.agents if a.dynamic.evacuated)
-            orch.casualty_count = sum(1 for a in orch.agents if not a.dynamic.alive)
-            active_count = orch.num_agents - orch.evacuated_count - orch.casualty_count
+            # Stats: single pass over agents
+            evac = 0; dead = 0
+            for a in orch.agents:
+                if a.dynamic.evacuated: evac += 1
+                elif not a.dynamic.alive: dead += 1
+            orch.evacuated_count = evac
+            orch.casualty_count = dead
+            active_count = orch.num_agents - evac - dead
 
             # ---- Render frame to FILE (most reliable for Gradio) ----
             if orch.tick % 10 == 0:

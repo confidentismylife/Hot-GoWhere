@@ -251,6 +251,20 @@ class SafetyGuard:
 
         return best_idx
 
+    def check_exit_safety(self, exit_idx: int,
+                           env: EnvironmentSnapshot) -> dict:
+        """Quick check: is this exit safe? Used by comparison framework."""
+        if exit_idx < 0 or exit_idx >= len(env.exits):
+            return {"blocked": True, "reason": "Invalid exit index"}
+        smoke = env.smoke_at(np.array(env.exits[exit_idx], dtype=np.float64))
+        blocked = smoke > self.EXIT_SMOKE_BLOCK
+        return {
+            "blocked": blocked,
+            "smoke": float(smoke),
+            "exit_idx": exit_idx,
+            "reason": "浓烟封锁" if blocked else "安全",
+        }
+
     def fallback_decision(self, agent: Agent,
                           env: EnvironmentSnapshot) -> dict:
         """Generate a safe fallback decision when LLM output is unrecoverable."""

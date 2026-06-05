@@ -9,6 +9,7 @@ Key optimizations for 24GB 4090:
 """
 
 import json
+import os
 import time
 import queue
 import threading
@@ -56,6 +57,7 @@ class LLMCognitiveEngine:
         self.temperature = config.get("temperature", 0.3)
         self.max_tokens = config.get("max_tokens", 128)
         self.batch_size = config.get("batch_size", 32)
+        self.lora_path = config.get("lora_path", None)  # LoRA adapter path
 
         self.llm = None
         self.tokenizer = None
@@ -80,7 +82,7 @@ class LLMCognitiveEngine:
 
         from vllm import LLM, SamplingParams
 
-        self.llm = LLM(
+        vllm_kwargs = dict(
             model=self.model_name,
             quantization=self.quantization if self.quantization != "none" else None,
             max_model_len=self.max_model_len,
@@ -89,6 +91,14 @@ class LLMCognitiveEngine:
             dtype="float16",
             trust_remote_code=True,
         )
+
+        # vLLM LoRA adapter support
+        if self.lora_path and os.path.isdir(self.lora_path):
+            vllm_kwargs["enable_lora"] = True
+            vllm_kwargs["max_lora_rank"] = 64
+            print(f"[CogEngine] LoRA adapter enabled: {self.lora_path}")
+
+        self.llm = LLM(**vllm_kwargs)
         self.tokenizer = self.llm.get_tokenizer()
         self.sampling_params = SamplingParams(
             temperature=self.temperature,

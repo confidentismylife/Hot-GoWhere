@@ -89,6 +89,10 @@ def main():
         "--vlm-mock", action="store_true",
         help="Use mock VLM (synthetic NL from env state, no GPU needed)"
     )
+    parser.add_argument(
+        "--lora", type=str, default=None,
+        help="Path to LoRA adapter for fine-tuned LLM"
+    )
     args = parser.parse_args()
 
     # --- Web 模式: 启动 Flask 服务器 ---
@@ -145,6 +149,8 @@ def main():
         orchestrator.cfg.setdefault("vlm", {})["call_interval"] = args.vlm_interval
     if args.vlm_mock:
         orchestrator.cfg.setdefault("vlm", {})["mock"] = True
+    if args.lora:
+        orchestrator.cfg.setdefault("llm", {})["lora_path"] = args.lora
 
     # Run
     try:

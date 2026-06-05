@@ -36,6 +36,7 @@ llm:
   temperature: 0.3
   max_tokens: 128
   batch_size: 32                # vLLM continuous batching batch size
+  lora_path: ""                 # Optional: path to LoRA adapter
 
 knowledge_base:
   persist_dir: "./data/disaster_kb"

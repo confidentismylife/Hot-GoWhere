@@ -46,6 +46,10 @@ def main():
         help="Override number of agents"
     )
     parser.add_argument(
+        "--duration", "-d", type=float, default=None,
+        help="Override simulation duration in seconds"
+    )
+    parser.add_argument(
         "--model", "-m", type=str, default=None,
         help="Override LLM model name"
     )
@@ -115,6 +119,10 @@ def main():
     if args.agents is not None:
         orchestrator.num_agents = args.agents
         orchestrator.cfg["simulation"]["num_agents"] = args.agents
+
+    if args.duration is not None:
+        orchestrator.duration = args.duration
+        orchestrator.cfg["simulation"]["duration"] = args.duration
 
     if args.model:
         orchestrator.cfg["llm"]["model"] = args.model

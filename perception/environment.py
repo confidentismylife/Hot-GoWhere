@@ -29,6 +29,11 @@ class EnvironmentSnapshot:
     official_broadcast: str = ""
     disaster_type: str = "fire"
 
+    # Strategic context for LLM reasoning (v2.2)
+    fire_origin: Tuple[float, float] = (0.0, 0.0)
+    spread_rate: float = 0.05
+    exit_crowd_counts: List[int] = field(default_factory=list)
+
     def smoke_at(self, pos: np.ndarray) -> float:
         r, c = self._to_grid(pos)
         if 0 <= r < self.grid.shape[0] and 0 <= c < self.grid.shape[1]:
@@ -63,13 +68,17 @@ class DisasterSimulator:
     Fire spread uses a modified Gaussian kernel. Flood and earthquake
     use simpler propagation rules. All tuned to run in <1ms per tick
     on a 100×60m grid at 0.5m resolution.
+
+    wall_mask: optional boolean grid (rows, cols) where True = impassable wall.
+               Fire and smoke do not spread through wall cells.
     """
 
     def __init__(self, width: float, height: float,
                  disaster_type: str,
                  origin: Tuple[float, float],
                  spread_rate: float,
-                 resolution: float = 0.5):
+                 resolution: float = 0.5,
+                 wall_mask: np.ndarray = None):
         self.width = width
         self.height = height
         self.disaster_type = disaster_type
@@ -85,9 +94,20 @@ class DisasterSimulator:
         self.grid[:, :, 1] = 25.0   # ambient temperature
         self.grid[:, :, 2] = 1.0    # structural integrity
 
+        # Wall mask: fire/smoke don't spread through walls
+        if wall_mask is not None:
+            # Downsample or upsample wall_mask to match grid resolution
+            from PIL import Image
+            wall_img = Image.fromarray((wall_mask.astype(np.uint8) * 255))
+            wall_img = wall_img.resize((self.cols, self.rows), Image.NEAREST)
+            self.wall_mask = np.array(wall_img) > 128
+        else:
+            self.wall_mask = np.zeros((self.rows, self.cols), dtype=bool)
+
         # Initialize disaster origin
         or_r, or_c = self._world_to_grid(self.origin)
-        self._ignite_cell(or_r, or_c, intensity=1.0)
+        if not self.wall_mask[or_r, or_c]:
+            self._ignite_cell(or_r, or_c, intensity=1.0)
 
         # Pre-compute Gaussian kernel for fire spread
         self.kernel = self._make_kernel(sigma=1.5)
@@ -152,14 +172,17 @@ class DisasterSimulator:
                 nr, nc = r + dr, c + dc
                 if (0 <= nr < self.rows and 0 <= nc < self.cols
                         and not fire_mask[nr, nc]
+                        and not self.wall_mask[nr, nc]
                         and np.random.random() < ignite_prob):
                     new_fire_mask[nr, nc] = True
 
         self.grid[new_fire_mask, 3] = 1.0
 
         # Smoke: diffusion + production from fire
-        smoke = self.grid[:, :, 0]
-        # Simple diffusion (average with neighbors)
+        smoke = self.grid[:, :, 0].copy()
+        # Block smoke at walls before diffusion
+        smoke[self.wall_mask] = 0.0
+        # Simple diffusion (average with neighbors), walls are impervious
         smoke_padded = np.pad(smoke, 1, mode='edge')
         smoke_diffused = (
             smoke_padded[1:-1, 1:-1] * 0.6 +
@@ -168,9 +191,16 @@ class DisasterSimulator:
             smoke_padded[1:-1, 2:] * 0.1 +
             smoke_padded[1:-1, :-2] * 0.1
         )
+        # Zero out smoke diffusion INTO walls (wall cells don't accumulate smoke)
+        smoke_diffused[self.wall_mask] = 0.0
         # Production from fire
         smoke_new = smoke_diffused + self.grid[:, :, 3] * 0.05 * dt
         self.grid[:, :, 0] = np.clip(smoke_new, 0.0, 1.0)
+
+        # Walls are impervious — no smoke, fire, or temperature inside
+        self.grid[self.wall_mask, 0] = 0.0
+        self.grid[self.wall_mask, 3] = 0.0
+        self.grid[self.wall_mask, 1] = 25.0  # Wall temperature reset to ambient
 
         # Temperature: rises near fire, slowly dissipates elsewhere
         fire_temp = 300.0 + self.grid[:, :, 3] * 500.0
@@ -181,18 +211,6 @@ class DisasterSimulator:
             fire_temp,
             self.grid[:, :, 1] * (1 - dissipation_rate) + ambient * dissipation_rate
         )
-
-    def _convolve_2d(self, padded: np.ndarray, kernel: np.ndarray,
-                     pad_h: int, pad_w: int) -> np.ndarray:
-        """Manual 2D convolution (avoids scipy dependency)."""
-        kh, kw = kernel.shape
-        out_h = padded.shape[0] - kh + 1
-        out_w = padded.shape[1] - kw + 1
-        result = np.zeros((out_h, out_w), dtype=np.float32)
-        for i in range(kh):
-            for j in range(kw):
-                result += padded[i:i+out_h, j:j+out_w] * kernel[i, j]
-        return result
 
     def _step_flood(self, dt: float):
         """Simplified flood: water level rises and spreads outward."""
@@ -225,7 +243,9 @@ class DisasterSimulator:
     def snapshot(self, tick: int, timestamp: float,
                  exits: List[Tuple[float, float]],
                  obstacles: List[dict],
-                 official_broadcast: str = "") -> EnvironmentSnapshot:
+                 official_broadcast: str = "",
+                 exit_crowd_counts: List[int] = None) -> EnvironmentSnapshot:
+        n_exits = len(exits)
         return EnvironmentSnapshot(
             tick=tick,
             timestamp=timestamp,
@@ -237,4 +257,8 @@ class DisasterSimulator:
             obstacles=obstacles,
             official_broadcast=official_broadcast,
             disaster_type=self.disaster_type,
+            fire_origin=(float(self.origin[0]), float(self.origin[1])),
+            spread_rate=self.spread_rate,
+            exit_crowd_counts=(exit_crowd_counts if exit_crowd_counts is not None
+                               else [0] * n_exits),
         )

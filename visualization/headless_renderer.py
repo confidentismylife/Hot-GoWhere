@@ -24,11 +24,13 @@ class HeadlessRenderer:
 
     def __init__(self, output_dir: str = "./frames",
                  frame_interval: int = 10,  # Save every 10 ticks (1 frame/sec at dt=0.1)
-                 dpi: int = 100):
+                 dpi: int = 100,
+                 floorplan=None):
         self.output_dir = output_dir
         self.frame_interval = frame_interval
         self.dpi = dpi
         self.frame_count = 0
+        self.floorplan = floorplan
         self._imported = False
 
     def initialize(self, width: float, height: float):
@@ -61,6 +63,26 @@ class HeadlessRenderer:
         ax.set_ylim(0, self.world_h)
         ax.set_aspect('equal')
         ax.set_facecolor('#F0F0F5')
+
+        # --- Floor plan walls ---
+        if self.floorplan:
+            fp = self.floorplan
+            grid = fp.grid
+            rows, cols = grid.shape
+            cell_w = fp.width / cols
+            cell_h = fp.height / rows
+            wall_mask = grid == 1
+            if wall_mask.any():
+                wr, wc = np.where(wall_mask)
+                step = max(1, min(rows, cols) // 200)
+                for r, c in zip(wr[::step], wc[::step]):
+                    wx = c * cell_w
+                    wy = r * cell_h  # row 0 = y=0 (bottom)
+                    rect = self.plt.Rectangle(
+                        (wx, wy), cell_w * step, cell_h * step,
+                        facecolor='#78787D', edgecolor='none', alpha=0.8
+                    )
+                    ax.add_patch(rect)
 
         # --- Smoke overlay ---
         step = max(1, env.grid.shape[1] // 60)

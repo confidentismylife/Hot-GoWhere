@@ -22,11 +22,12 @@ from typing import List
 SYSTEM_PROMPT_CIVILIAN = """你是一个在{disaster_type}灾害中进行疏散的普通人。你需要根据环境信息做出理性的疏散决策。
 
 你的决策原则:
-1. 安全优先: 选择风险最低的出口和路线
-2. 量力而行: 体力不足时不要奔跑,受伤后降低速度
-3. 信息判断: 官方广播通常可靠,但也要观察实际环境
-4. 家庭责任: 如果有家人在附近,应该互相照应
-5. 适应性: 如果原定路线出现危险,及时调整计划
+1. 安全优先: 远离火源,选择火源距离远、烟雾轻的出口,即使路程更远
+2. 预判风险: 注意火源位置和蔓延速度,靠近火源的出口即使当前通畅也会很快变得危险
+3. 避免拥堵: 如果某个出口已有大量人群聚集,考虑备选出口以减少排队时间
+4. 量力而行: 体力不足时不要奔跑,步行速度约1.2m/s,评估自己能否在体力耗尽前到达
+5. 信息判断: 官方广播通常可靠,但也要观察实际环境
+6. 适应性: 如果原定路线出现危险,及时调整计划
 
 {knowledge_section}
 
@@ -158,15 +159,18 @@ class PromptManager:
 
     def build_user(self, agent: Agent, env: EnvironmentSnapshot,
                    vlm_description: str = "",
-                   yolo_result=None) -> str:
+                   yolo_result=None,
+                   rl_preference: str = "") -> str:
         """Build user prompt. Agent-specific context.
 
         v2.0: 支持双通道感知 (VLM + YOLO) 注入.
+        v2.1: 支持RL调度建议注入.
         """
         context = self.nl_converter.full_context(
             agent, env,
             vlm_description=vlm_description,
             yolo_result=yolo_result,
+            rl_preference=rl_preference,
         )
 
         role = agent.profile.role
@@ -176,12 +180,16 @@ class PromptManager:
 
     @staticmethod
     def parse_response(text: str) -> dict:
-        """Robust JSON extraction from LLM output."""
+        """Robust JSON extraction from LLM output.
+
+        Handles common LLM formatting errors: trailing commas, single quotes,
+        markdown code fences, and text outside JSON braces.
+        """
         text = text.strip()
         # Remove markdown code blocks if present
         if text.startswith("```"):
             lines = text.split("\n")
-            start = 1  # Skip opening fence
+            start = 1  # Skip opening fence (may include language tag)
             end = len(lines)
             for i in range(len(lines) - 1, 0, -1):
                 if lines[i].strip().startswith("```"):
@@ -196,4 +204,27 @@ class PromptManager:
             text = text[start:end]
 
         import json
-        return json.loads(text)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+
+        # Repair common LLM formatting errors
+        repaired = PromptManager._repair_json(text)
+        return json.loads(repaired)
+
+    @staticmethod
+    def _repair_json(text: str) -> str:
+        """Repair common JSON formatting errors from LLM output."""
+        import re
+        # Remove trailing commas before closing braces/brackets
+        text = re.sub(r',\s*}', '}', text)
+        text = re.sub(r',\s*]', ']', text)
+        # Replace single quotes with double quotes (keys and string values)
+        # Simple heuristic: replace 'key': with "key":
+        text = re.sub(r"'([^']*)'\s*:", r'"\1":', text)
+        # Replace : 'value' with : "value"
+        text = re.sub(r":\s*'([^']*)'", r': "\1"', text)
+        # Unquoted keys: word immediately before :
+        text = re.sub(r'(?<![}"\s])(\w+)(?=\s*:)', r'"\1"', text)
+        return text

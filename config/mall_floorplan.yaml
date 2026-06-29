@@ -1,0 +1,108 @@
+# 北京朝阳大悦城 1F — Real Shopping Mall Evacuation Scenario
+#
+# 150m × 80m, central atrium, 4 corridors, 8 exits, 30+ shops
+# Layout: ring corridor around central atrium, shops on perimeter
+#
+# Usage:
+#   python main.py --config config/mall_floorplan.yaml --gradio
+#   python main.py --config config/mall_floorplan.yaml --agents 500 --record
+
+simulation:
+  num_agents: 600              # Mall typical occupancy on one floor
+  duration: 360                 # 6 minutes (longer due to larger area)
+  dt: 0.1
+  decision_interval: 10.0          # Longer interval → fewer LLM requests, lower backlog
+  seed: 42
+
+environment:
+  type: "mall"                  # NEW: mall floor plan mode
+  floorplan: "chaoyang_joycity_1f"  # Built-in floor plan name
+  width: 150.0                  # Overridden by floorplan, fallback for compatibility
+  height: 80.0                  # Overridden by floorplan, fallback for compatibility
+  disaster: "fire"
+  disaster_origin: [120.0, 65.0]   # Kitchen/restaurant area (southeast)
+  disaster_spread_rate: 0.10       # Faster spread → LLM proactive advantage matters more
+  exit_positions:               # Override floorplan: 4 exits → congestion → LLM advantage
+    - [75.0, 2.0]     # 南 — 适中距离
+    - [2.0, 40.0]     # 西 — 安全，远离火源
+    - [148.0, 40.0]   # 东 — 近火源，风险出口
+    - [75.0, 78.0]    # 北 — 安全，远离火源
+
+  # Exits are defined by the floor plan, but can be overridden here
+  # exit_positions: [...]          # Leave empty to use floor plan defaults
+  # obstacles: [...]               # Leave empty to use floor plan defaults
+
+llm:
+  model: "Qwen/Qwen2.5-7B-Instruct-AWQ"
+  quantization: "awq"
+  max_model_len: 4096
+  gpu_memory_utilization: 0.85      # 7B AWQ ~3.5GB + KV cache, leave margin for 32GB card
+  temperature: 0.3
+  max_tokens: 128                    # Must be ≥128 for complete JSON with Chinese reasoning
+  batch_size: 32
+  lora_path: ""
+
+knowledge_base:
+  persist_dir: "./data/disaster_kb"
+  embedding_model: "BAAI/bge-small-zh-v1.5"
+
+agents:
+  age_groups:
+    young:    {min: 18, max: 35, weight: 0.40}    # Mall skews younger
+    middle:   {min: 36, max: 55, weight: 0.40}
+    elderly:  {min: 56, max: 80, weight: 0.15}
+    child:    {min: 5,  max: 17, weight: 0.05}    # Children in mall
+  familiarity_distribution:
+    low:     {range: [0.0, 0.3], weight: 0.4}     # More first-time visitors
+    medium:  {range: [0.3, 0.7], weight: 0.4}
+    high:    {range: [0.7, 1.0], weight: 0.2}     # Staff & regulars
+  family_group_probability: 0.35                   # Higher family ratio in mall
+  max_speed_range: [0.8, 2.0]
+
+visualization:
+  enabled: true
+  width: 1400     # Wider for 150m layout
+  height: 750     # Aspect ratio ~2:1
+
+vlm:
+  enabled: false
+  model: "Qwen/Qwen2.5-VL-7B-Instruct-AWQ"
+  call_interval: 30
+
+yolo:
+  model: "yolov8n.pt"
+  conf_threshold: 0.35
+  call_interval: 10
+
+diffusion:
+  enabled: false
+  d_model: 256
+  nhead: 8
+  num_layers: 6
+  num_inference_steps: 100
+  checkpoint: "./checkpoints/diffusion_final.pt"
+
+# ================================================================
+# LLM → IRL → RL Three-Tier Cascade Architecture
+# ================================================================
+# IRL (Inverse Reinforcement Learning) — recover reward weights from LLM behavior
+irl:
+  enabled: false                          # Enable trajectory collection during simulation
+  output_dir: "data/trajectories"         # Where to save .jsonl trajectory files
+  min_trajectories_per_persona: 10        # Minimum trajectories for IRL fitting
+  learning_rate: 0.01                     # MaxEnt IRL gradient step size
+  max_iter: 500                           # Max IRL iterations per persona
+
+# RL Zone Scheduling — P-MAPPO zone-level exit recommendations
+rl_scheduling:
+  enabled: false                          # Enable RL zone scheduler during simulation
+  pretrained_weights: ""                  # Path to pretrained policy weights (empty = heuristic)
+  irl_weights: "data/irl_weights.json"   # Path to IRL-learned reward weights
+  rl_inference_interval: 1                # Ticks between RL inference (1 = every tick)
+
+# Zone definitions for RL scheduler (4 quadrants of 150m×80m mall)
+zones:
+  - {id: 0, name: "西北区", x_min: 0,   x_max: 75,  y_min: 40, y_max: 80, primary_exits: [1,3], description: "商场西北区域，靠近ZARA、H&M"}
+  - {id: 1, name: "东北区", x_min: 75,  x_max: 150, y_min: 40, y_max: 80, primary_exits: [2,3], description: "商场东北区域，靠近优衣库、海底捞"}
+  - {id: 2, name: "西南区", x_min: 0,   x_max: 75,  y_min: 0,  y_max: 40, primary_exits: [0,1], description: "商场西南区域，靠近星巴克、Apple"}
+  - {id: 3, name: "东南区", x_min: 75,  x_max: 150, y_min: 0,  y_max: 40, primary_exits: [0,2], description: "商场东南区域，靠近华为、餐饮区"}

@@ -83,21 +83,55 @@ class SafetyGuard:
         )
 
         # --- Rule execution order matters ---
+        # Phase 1: evaluate all constraints (some may swap the exit)
         self._check_exit_smoke(decision, agent, env, result)
         self._check_fire_proximity(decision, agent, env, result)
         self._check_stamina_speed(decision, agent, result)
         self._check_injured_speed(decision, agent, result)
         self._check_agent_on_fire(decision, agent, env, result)
         self._check_distance_sanity(decision, agent, env, result)
-        self._check_wait_on_fire(decision, agent, env, result)
+        self._check_wait_on_hazard(decision, agent, env, result)
 
-        # If exit was changed, validate the new one
+        # Phase 2: if exit was swapped, re-validate the new exit fully
         if result.modified and result.final_exit_idx != result.original_exit_idx:
-            new_exit_pos = env.exits[result.final_exit_idx]
-            new_smoke = env.smoke_at(np.array(new_exit_pos, dtype=np.float64))
+            new_idx = result.final_exit_idx
+            new_exit_pos = env.exits[new_idx]
+            new_smoke = float(env.smoke_at(np.array(new_exit_pos, dtype=np.float64)))
+
+            # BLOCK check: new exit must not be heavily smoked
             if new_smoke > self.EXIT_SMOKE_BLOCK:
                 result.passed = False
                 result.block_reason = "所有出口均被浓烟封锁"
+                return result
+
+            # WARN check: re-check smoke warning on new exit
+            if new_smoke > self.EXIT_SMOKE_WARN:
+                result.warnings.append(
+                    f"切换后出口{new_idx+1}有烟雾({new_smoke:.0%}), 请注意安全"
+                )
+
+            # Distance sanity: re-check the new exit isn't unreasonably far
+            new_dist = float(np.linalg.norm(np.array(new_exit_pos) - agent.position))
+            if new_dist > self.EXIT_DISTANCE_MAX:
+                result.warnings.append(
+                    f"切换后出口{new_idx+1}距离{new_dist:.0f}m超过合理范围"
+                )
+
+            # Fire path: re-check that the new exit path doesn't cross fire
+            path_clear = True
+            new_dist = float(np.linalg.norm(np.array(new_exit_pos) - agent.position))
+            steps = max(8, int(new_dist * 2))  # At least 2 samples per meter
+            for t in range(steps + 1):
+                alpha = t / steps
+                px = agent.position[0] + alpha * (new_exit_pos[0] - agent.position[0])
+                py = agent.position[1] + alpha * (new_exit_pos[1] - agent.position[1])
+                if env.is_on_fire(np.array([px, py], dtype=np.float64)):
+                    path_clear = False
+                    break
+            if not path_clear:
+                result.warnings.append(
+                    f"切换后出口{new_idx+1}路径仍经过火源"
+                )
 
         return result
 
@@ -130,11 +164,12 @@ class SafetyGuard:
     def _check_fire_proximity(self, decision, agent: Agent,
                               env: EnvironmentSnapshot, result: SafetyResult):
         """Block if target exit requires crossing within FIRE_SAFE_DISTANCE of fire."""
-        exit_pos = env.exits[decision.target_exit_idx]
+        exit_pos = env.exits[result.final_exit_idx]  # Use potentially swapped exit
         agent_pos = agent.position
 
         # Sample points along the path and check fire proximity
-        steps = 8
+        dist = float(np.linalg.norm(np.array(exit_pos) - agent.position))
+        steps = max(8, int(dist * 2))  # At least 2 samples per meter
         for t in range(steps + 1):
             alpha = t / steps
             px = agent_pos[0] + alpha * (exit_pos[0] - agent_pos[0])
@@ -179,21 +214,18 @@ class SafetyGuard:
 
     def _check_agent_on_fire(self, decision, agent: Agent,
                              env: EnvironmentSnapshot, result: SafetyResult):
-        """Agent standing on fire must move immediately."""
+        """Agent standing on fire must move immediately — force RUN."""
         if env.is_on_fire(agent.position):
-            if decision.speed == Speed.WAIT:
+            current_speed = result.final_speed  # May have been modified by prior checks
+            if current_speed != Speed.RUN.value:
                 result.final_speed = Speed.RUN.value
-                result.warnings.append("所在位置已着火, wait→run")
-                result.modified = True
-            elif decision.speed == Speed.CRAWL:
-                result.final_speed = Speed.RUN.value
-                result.warnings.append("所在位置已着火, crawl→run")
+                result.warnings.append(f"所在位置已着火, {current_speed}→run")
                 result.modified = True
 
     def _check_distance_sanity(self, decision, agent: Agent,
                                env: EnvironmentSnapshot, result: SafetyResult):
         """Flag unreasonably far exits (likely LLM hallucination)."""
-        exit_pos = env.exits[decision.target_exit_idx]
+        exit_pos = env.exits[result.final_exit_idx]  # Use potentially swapped exit
         dist = float(np.linalg.norm(np.array(exit_pos) - agent.position))
 
         if dist > self.EXIT_DISTANCE_MAX and len(env.exits) > 1:
@@ -205,10 +237,14 @@ class SafetyGuard:
             result.final_exit_idx = best_idx
             result.modified = True
 
-    def _check_wait_on_fire(self, decision, agent: Agent,
-                            env: EnvironmentSnapshot, result: SafetyResult):
-        """Don't wait if smoke at current position is heavy."""
-        if decision.speed != Speed.WAIT:
+    def _check_wait_on_hazard(self, decision, agent: Agent,
+                               env: EnvironmentSnapshot, result: SafetyResult):
+        """Don't wait if smoke/temperature at current position is hazardous.
+
+        Checks result.final_speed (not decision.speed) to avoid overwriting
+        prior escalations (e.g. on-fire → RUN set by _check_agent_on_fire).
+        """
+        if result.final_speed != Speed.WAIT.value:
             return
 
         smoke = env.smoke_at(agent.position)
@@ -227,27 +263,45 @@ class SafetyGuard:
 
     def _best_exit(self, agent_pos: np.ndarray,
                    env: EnvironmentSnapshot) -> int:
-        """Find the best exit: closest balance of distance and smoke."""
+        """Find the best exit: closest balance of distance and smoke.
+
+        If all exits are smoke-blocked, returns the one with minimum smoke
+        (least bad option) rather than silently returning a blocked exit.
+        """
+        if not env.exits:
+            return 0
+
         best_idx = 0
         best_score = float("inf")
+        all_blocked = True
+        min_smoke_idx = 0
+        min_smoke_val = float("inf")
 
         for i, exit_pos in enumerate(env.exits):
             dist = float(np.linalg.norm(np.array(exit_pos) - agent_pos))
             smoke = env.smoke_at(np.array(exit_pos, dtype=np.float64))
 
-            # Smoke penalty grows exponentially after warn threshold
-            if smoke > self.EXIT_SMOKE_BLOCK:
-                continue  # Skip blocked exits entirely
+            # Track exit with minimum smoke (fallback if all blocked)
+            if smoke < min_smoke_val:
+                min_smoke_val = smoke
+                min_smoke_idx = i
 
+            if smoke > self.EXIT_SMOKE_BLOCK:
+                continue  # Skip blocked exits for normal scoring
+
+            all_blocked = False
             smoke_penalty = 0.0
-            if smoke > self.EXIT_SMOKE_WARN:
-                smoke_penalty = ((smoke - self.EXIT_SMOKE_WARN) /
-                                 (self.EXIT_SMOKE_BLOCK - self.EXIT_SMOKE_WARN)) * 300
+            smoke_range = self.EXIT_SMOKE_BLOCK - self.EXIT_SMOKE_WARN
+            if smoke > self.EXIT_SMOKE_WARN and smoke_range > 1e-6:
+                smoke_penalty = ((smoke - self.EXIT_SMOKE_WARN) / smoke_range) * 300
 
             score = dist + smoke_penalty
             if score < best_score:
                 best_score = score
                 best_idx = i
+
+        if all_blocked:
+            return min_smoke_idx
 
         return best_idx
 

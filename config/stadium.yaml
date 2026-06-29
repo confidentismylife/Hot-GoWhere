@@ -1,0 +1,76 @@
+# 体育馆疏散场景 — Stadium Evacuation Scenario
+# 200m × 120m, open arena, 12 exits on perimeter, bleacher seating
+simulation:
+  num_agents: 800
+  duration: 480
+  dt: 0.1
+  decision_interval: 3.0
+  seed: 42
+
+environment:
+  type: "stadium"
+  floorplan: "indoor_stadium"
+  width: 200.0
+  height: 120.0
+  disaster: "fire"
+  disaster_origin: [150.0, 90.0]
+  disaster_spread_rate: 0.15
+  exit_positions:
+    - [30.0, 2.0]
+    - [70.0, 2.0]
+    - [110.0, 2.0]
+    - [150.0, 2.0]
+    - [30.0, 118.0]
+    - [70.0, 118.0]
+    - [110.0, 118.0]
+    - [150.0, 118.0]
+    - [2.0, 30.0]
+    - [2.0, 70.0]
+    - [198.0, 30.0]
+    - [198.0, 70.0]
+
+llm:
+  model: "Qwen/Qwen2.5-3B-Instruct-AWQ"
+  quantization: "awq"
+  max_model_len: 4096
+  gpu_memory_utilization: 0.85
+  temperature: 0.3
+  max_tokens: 128
+  batch_size: 32
+
+knowledge_base:
+  persist_dir: "./data/disaster_kb"
+  embedding_model: "BAAI/bge-small-zh-v1.5"
+
+agents:
+  age_groups:
+    young:    {min: 18, max: 35, weight: 0.50}
+    middle:   {min: 36, max: 55, weight: 0.35}
+    elderly:  {min: 56, max: 80, weight: 0.10}
+    child:    {min: 5,  max: 17, weight: 0.05}
+  familiarity_distribution:
+    low:     {range: [0.0, 0.3], weight: 0.6}
+    medium:  {range: [0.3, 0.7], weight: 0.3}
+    high:    {range: [0.7, 1.0], weight: 0.1}
+  family_group_probability: 0.30
+  max_speed_range: [0.8, 2.0]
+
+irl:
+  enabled: false
+  output_dir: "data/trajectories"
+  min_trajectories_per_persona: 10
+  learning_rate: 0.01
+  max_iter: 500
+
+rl_scheduling:
+  enabled: false
+  pretrained_weights: ""
+  irl_weights: "data/irl_weights.json"
+  rl_inference_interval: 1
+
+# Stadium: 4 zones (quadrants of the arena)
+zones:
+  - {id: 0, name: "西北看台", x_min: 0,   x_max: 100, y_min: 60, y_max: 120, primary_exits: [0,1,4,5,8,9], description: "西北侧看台区域"}
+  - {id: 1, name: "东北看台", x_min: 100, x_max: 200, y_min: 60, y_max: 120, primary_exits: [2,3,6,7,10,11], description: "东北侧看台区域"}
+  - {id: 2, name: "西南看台", x_min: 0,   x_max: 100, y_min: 0,  y_max: 60,  primary_exits: [0,1,4,5,8,9], description: "西南侧看台区域"}
+  - {id: 3, name: "东南看台", x_min: 100, x_max: 200, y_min: 0,  y_max: 60,  primary_exits: [2,3,6,7,10,11], description: "东南侧看台区域"}

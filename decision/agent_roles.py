@@ -113,17 +113,31 @@ class GuideDecision:
 
 def define_zones(exits: List[Tuple[float, float]],
                  width: float, height: float) -> List[dict]:
-    """Divide the environment into zones, one per exit + one for hazard origin.
+    """Divide the environment into quadrant zones.
 
-    Simple approach: each zone is the Voronoi region of an exit,
-    plus a dedicated hazard zone around the disaster origin.
+    Creates 4 spatial quadrants (NW, NE, SW, SE) based on the midpoint
+    of the floorplan, with each zone associated with the nearest exits.
     """
+    mid_x, mid_y = width / 2.0, height / 2.0
+    quadrant_bounds = [
+        (0.0, mid_x, mid_y, height, "西北区"),      # NW
+        (mid_x, width, mid_y, height, "东北区"),     # NE
+        (0.0, mid_x, 0.0, mid_y, "西南区"),          # SW
+        (mid_x, width, 0.0, mid_y, "东南区"),        # SE
+    ]
     zones = []
-    for i, exit_pos in enumerate(exits):
+    for i, (x_min, x_max, y_min, y_max, label) in enumerate(quadrant_bounds):
+        primary = []
+        for e_idx, (ex, ey) in enumerate(exits):
+            if x_min - 10 <= ex <= x_max + 10 and y_min - 10 <= ey <= y_max + 10:
+                primary.append(e_idx)
+        if not primary:
+            primary = list(range(len(exits)))
         zones.append({
             "id": i,
-            "exit_idx": i,
-            "exit_pos": exit_pos,
-            "label": f"区域{i+1}(出口{i+1})",
+            "x_min": x_min, "x_max": x_max,
+            "y_min": y_min, "y_max": y_max,
+            "primary_exits": primary,
+            "label": label,
         })
     return zones

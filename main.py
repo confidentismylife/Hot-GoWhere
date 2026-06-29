@@ -93,6 +93,22 @@ def main():
         "--lora", type=str, default=None,
         help="Path to LoRA adapter for fine-tuned LLM"
     )
+    parser.add_argument(
+        "--train-rl", action="store_true",
+        help="Train RL zone scheduler offline (fast rule-based simulator, no LLM)"
+    )
+    parser.add_argument(
+        "--train-rl-episodes", type=int, default=500,
+        help="Number of offline RL training episodes (default: 500)"
+    )
+    parser.add_argument(
+        "--irl-weights", type=str, default="data/irl_weights.json",
+        help="Path to IRL-learned weights JSON for RL training"
+    )
+    parser.add_argument(
+        "--rl-output", type=str, default="data/rl_policy.json",
+        help="Output path for trained RL policy weights"
+    )
     args = parser.parse_args()
 
     # --- Web 模式: 启动 Flask 服务器 ---
@@ -151,6 +167,15 @@ def main():
         orchestrator.cfg.setdefault("vlm", {})["mock"] = True
     if args.lora:
         orchestrator.cfg.setdefault("llm", {})["lora_path"] = args.lora
+
+    # RL training mode (offline, no LLM)
+    if args.train_rl:
+        orchestrator.train_rl_scheduler(
+            episodes=args.train_rl_episodes,
+            irl_weights_path=args.irl_weights,
+            output_path=args.rl_output,
+        )
+        return
 
     # Run
     try:

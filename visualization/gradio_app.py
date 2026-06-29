@@ -54,6 +54,7 @@ _sim_state = {
     "safety_blocks": 0,
     "safety_modifications": 0,
     "history": [],
+    "decision_log": [],      # Recent LLM decisions for info panel
     "lock": threading.Lock(),
 }
 
@@ -75,13 +76,27 @@ def _fear_color(fear_level: float):
 
 
 def render_frame_pil(agents, env, tick, sim_time, evacuated, casualties,
-                     decisions, world_w, world_h):
+                     decisions, world_w, world_h, floorplan=None):
     """Render a frame → PIL Image."""
     fig, ax = plt.subplots(figsize=(10, 6), dpi=80)
     ax.set_xlim(0, world_w)
     ax.set_ylim(0, world_h)
     ax.set_aspect('equal')
     ax.set_facecolor('#F0F0F5')
+
+    # Floor plan walls — use imshow for speed (1 image vs 5000+ rectangles)
+    if floorplan is not None:
+        fp = floorplan
+        fp_grid = fp.grid
+        # Downsample grid for faster rendering (max 200 cells on long axis)
+        max_cells = 200
+        skip = max(1, max(fp_grid.shape) // max_cells)
+        wall_small = fp_grid[::skip, ::skip]
+        # Create RGBA image: white walkable (transparent), dark gray walls
+        wall_rgba = np.zeros((wall_small.shape[0], wall_small.shape[1], 4), dtype=np.float32)
+        wall_rgba[wall_small == 1] = [0.47, 0.47, 0.49, 0.85]  # #78787D with alpha
+        ax.imshow(wall_rgba, extent=[0, fp.width, 0, fp.height],
+                  origin='lower', interpolation='nearest', zorder=0)
 
     # Smoke
     step = max(1, env.grid.shape[1] // 60)
@@ -241,17 +256,20 @@ def run_simulation_thread(config_path: str, num_agents: Optional[int] = None):
                      orch.tick - a.dynamic.last_decision_tick >= orch.decision_ticks))
             ]
             if agents_to_decide:
-                # Cache KB query (knowledge docs don't change mid-simulation)
+                # Cache KB query: civilians get general common-sense, professionals get domain expertise
                 if orch.tick - orch._kb_cache_tick > 30:
-                    orch._kb_cache[orch.cfg['environment']['disaster']] = \
+                    d_type = orch.cfg['environment']['disaster']
+                    orch._kb_cache["professional"] = \
                         orch.knowledge_base.query(
-                            f"{orch.cfg['environment']['disaster']}疏散决策",
-                            disaster_type=orch.cfg['environment']['disaster'], top_k=3)
+                            f"{d_type}疏散决策", disaster_type=d_type, top_k=3)
+                    orch._kb_cache["civilian"] = \
+                        orch.knowledge_base.query(
+                            "通用安全常识", disaster_type="general", top_k=3)
                     orch._kb_cache_tick = orch.tick
                 orch.llm_engine.submit_batch(
                     agents_to_decide, env_snapshot,
-                    {orch.cfg['environment']['disaster']:
-                     orch._kb_cache.get(orch.cfg['environment']['disaster'], [])})
+                    {"professional": orch._kb_cache.get("professional", []),
+                     "civilian": orch._kb_cache.get("civilian", [])})
 
             decisions = orch.llm_engine.collect_results()
             if decisions:
@@ -264,6 +282,24 @@ def run_simulation_thread(config_path: str, num_agents: Optional[int] = None):
                     else:
                         civilian_decisions[aid] = d
                 orch.decision_count += len(decisions)
+
+                # Store in shared state for LLM decision log panel
+                with _sim_state["lock"]:
+                    for aid, d in decisions.items():
+                        agent = orch._find_agent(aid)
+                        fear = agent.dynamic.fear_level if agent else 0
+                        _sim_state["decision_log"].append({
+                            "sim_time": round(orch.sim_time, 1),
+                            "agent_id": aid,
+                            "reasoning": d.reasoning[:200] if d.reasoning else "",
+                            "risk": getattr(d, 'risk_assessment', ''),
+                            "target_exit": f"E{d.target_exit_idx+1}" if hasattr(d, 'target_exit_idx') and d.target_exit_idx >= 0 else "?",
+                            "speed": d.speed.value if hasattr(d.speed, 'value') else str(d.speed),
+                            "fear": round(fear, 1),
+                        })
+                    # Keep only last 200 entries
+                    if len(_sim_state["decision_log"]) > 200:
+                        _sim_state["decision_log"] = _sim_state["decision_log"][-200:]
                 orch.total_llm_time += sum(d.compute_time for d in decisions.values())
                 if civilian_decisions:
                     orch._apply_decisions(civilian_decisions, env_snapshot)
@@ -292,6 +328,7 @@ def run_simulation_thread(config_path: str, num_agents: Optional[int] = None):
                         orch.tick, orch.sim_time,
                         orch.evacuated_count, orch.casualty_count,
                         orch.decision_count, orch.width, orch.height,
+                        floorplan=getattr(orch, 'floorplan', None),
                     )
                     # Toggle between two files to avoid browser caching
                     _toggle = not _toggle
@@ -570,6 +607,235 @@ def send_broadcast(message: str):
 
 
 # ================================================================
+# Info Panel: Agent Status Table
+# ================================================================
+
+def get_agent_status_table():
+    """Generate an HTML table showing top agents' real-time status."""
+    global _orchestrator_ref
+    orch = _orchestrator_ref
+
+    if orch is None or not orch.agents:
+        return "<p style='color:#888;'>等待仿真启动...</p>"
+
+    agents = [a for a in orch.agents if a.dynamic.alive and not a.dynamic.evacuated]
+
+    if not agents:
+        with _sim_state["lock"]:
+            evac = _sim_state["evacuated_count"]
+            dead = _sim_state["casualty_count"]
+        return f"<p style='color:#3fb950;'>所有Agent已撤离 ({evac}疏散) 或 死亡 ({dead}伤亡)</p>"
+
+    # Sort by fear descending, show top 30
+    agents_sorted = sorted(agents, key=lambda a: a.dynamic.fear_level, reverse=True)[:30]
+
+    rows = []
+    for a in agents_sorted:
+        d = a.dynamic
+        p = a.profile
+        pos = d.position
+        fear = d.fear_level
+        # Fear color
+        if fear < 3:
+            fc = "#3fb950"
+        elif fear < 6:
+            fc = "#d29922"
+        else:
+            fc = "#f85149"
+
+        target = "—"
+        if d.target_exit is not None:
+            for i, ep in enumerate(orch.exits):
+                if np.linalg.norm(d.target_exit - np.array(ep)) < 0.5:
+                    target = f"E{i+1}"
+                    break
+            else:
+                target = f"({d.target_exit[0]:.0f},{d.target_exit[1]:.0f})"
+
+        role_emoji = {"civilian": "🧑", "global_commander": "🎖", "area_commander": "📡",
+                      "firefighter": "🚒", "guide": "🧭"}.get(p.role, "🧑")
+
+        stamina_color = "#3fb950" if d.stamina > 60 else ("#d29922" if d.stamina > 30 else "#f85149")
+
+        rows.append(
+            f"<tr>"
+            f"<td>{role_emoji}</td>"
+            f"<td style='font-family:monospace;'>{p.id[:6]}</td>"
+            f"<td style='color:{fc};font-weight:bold;'>{fear:.1f}</td>"
+            f"<td style='color:{stamina_color};'>{d.stamina:.0f}</td>"
+            f"<td>{d.speed_choice.value}</td>"
+            f"<td>{target}</td>"
+            f"<td>({pos[0]:.0f},{pos[1]:.0f})</td>"
+            f"</tr>"
+        )
+
+    table_html = f"""<div style='max-height:400px;overflow-y:auto;font-size:12px;'>
+<table style='width:100%;border-collapse:collapse;'>
+<thead style='position:sticky;top:0;background:#2d2d2d;color:#e0e0e0;'>
+<tr>
+  <th></th><th>ID</th><th>恐惧</th><th>体力</th><th>速度</th><th>目标</th><th>位置</th>
+</tr>
+</thead>
+<tbody>
+{''.join(rows)}
+</tbody>
+</table>
+</div>"""
+    return table_html
+
+
+# ================================================================
+# Info Panel: LLM Decision Log
+# ================================================================
+
+def get_decision_log():
+    """Return recent LLM reasoning decisions as formatted HTML."""
+    with _sim_state["lock"]:
+        log = list(_sim_state["decision_log"][-25:])
+
+    if not log:
+        with _sim_state["lock"]:
+            running = _sim_state["running"]
+        if running:
+            return "<p style='color:#d29922;'>等待LLM决策...</p>"
+        return "<p style='color:#888;'>暂无决策记录。</p>"
+
+    entries = []
+    for entry in reversed(log):  # Most recent first
+        t = entry["sim_time"]
+        aid = entry["agent_id"]
+        reasoning = entry.get("reasoning", "")
+        risk = entry.get("risk", "")
+        target = entry.get("target_exit", "?")
+        speed = entry.get("speed", "?")
+        fear = entry.get("fear", 0)
+
+        # Truncate long reasoning
+        if len(reasoning) > 120:
+            reasoning = reasoning[:120] + "..."
+
+        fear_color = "#3fb950" if fear < 3 else ("#d29922" if fear < 6 else "#f85149")
+
+        entries.append(
+            f"<div style='border-left:2px solid {fear_color};margin:4px 0;padding:4px 8px;"
+            f"background:#1e1e2e;border-radius:4px;font-size:11px;'>"
+            f"<b style='color:#58a6ff;'>[{t:.0f}s] {aid[:8]}</b> "
+            f"<span style='color:{fear_color};'>fear={fear:.1f}</span> | "
+            f"<span style='color:#d29922;'>→{target}</span> | "
+            f"<span>{speed}</span>"
+            f"<div style='color:#b0b0b0;margin-top:2px;'>{reasoning}</div>"
+            f"</div>"
+        )
+
+    return f"<div style='max-height:450px;overflow-y:auto;'>{''.join(entries)}</div>"
+
+
+# ================================================================
+# Info Panel: Fire & Smoke Conditions
+# ================================================================
+
+def get_fire_smoke_report():
+    """Generate fire/smoke conditions report."""
+    global _orchestrator_ref
+    orch = _orchestrator_ref
+
+    if orch is None:
+        return "<p style='color:#888;'>等待仿真启动...</p>"
+
+    try:
+        snap = orch.disaster.snapshot(0, 0, orch.exits, orch.obstacles)
+    except Exception:
+        return "<p style='color:#888;'>环境数据暂不可用。</p>"
+
+    grid = snap.grid
+    total_cells = grid.shape[0] * grid.shape[1]
+
+    # Fire coverage
+    fire_cells = int((grid[:, :, 3] > 0.5).sum())
+    fire_pct = fire_cells / total_cells * 100
+
+    # Smoke stats
+    smoke_vals = grid[:, :, 0]
+    smoke_cells = int((smoke_vals > 0.05).sum())
+    smoke_pct = smoke_cells / total_cells * 100
+    avg_smoke = float(smoke_vals.mean())
+    max_smoke = float(smoke_vals.max())
+
+    # Per-exit conditions
+    exit_lines = []
+    for i, ep in enumerate(orch.exits):
+        ex, ey = ep
+        gr = min(int(ey / snap.grid_resolution), grid.shape[0] - 1)
+        gc = min(int(ex / snap.grid_resolution), grid.shape[1] - 1)
+        exit_smoke = float(grid[gr, gc, 0])
+        exit_fire = float(grid[gr, gc, 3])
+
+        if exit_fire > 0.5:
+            status = "🔥 封锁"
+            sc = "#f85149"
+        elif exit_smoke > 0.6:
+            status = "💨 浓烟"
+            sc = "#d29922"
+        elif exit_smoke > 0.3:
+            status = "⚠ 轻烟"
+            sc = "#d29922"
+        else:
+            status = "✅ 畅通"
+            sc = "#3fb950"
+
+        # Count agents heading to this exit
+        heading = sum(1 for a in orch.agents
+                      if a.dynamic.alive and not a.dynamic.evacuated
+                      and a.dynamic.target_exit is not None
+                      and np.linalg.norm(a.dynamic.target_exit - np.array(ep)) < 2.0)
+
+        exit_lines.append(
+            f"<tr>"
+            f"<td style='font-weight:bold;'>E{i+1}</td>"
+            f"<td>({ex:.0f},{ey:.0f})</td>"
+            f"<td style='color:{sc};font-weight:bold;'>{status}</td>"
+            f"<td>烟{exit_smoke:.2f}</td>"
+            f"<td>火{exit_fire:.2f}</td>"
+            f"<td>{heading}人前往</td>"
+            f"</tr>"
+        )
+
+    # Overall status
+    if fire_pct > 10:
+        overall = "🔴 火势严重"
+        oc = "#f85149"
+    elif fire_pct > 3:
+        overall = "🟡 火势蔓延中"
+        oc = "#d29922"
+    elif fire_pct > 0:
+        overall = "🟢 火势初期"
+        oc = "#3fb950"
+    else:
+        overall = "⚪ 无明火"
+        oc = "#888"
+
+    report = f"""<div style='font-size:12px;'>
+<div style='margin-bottom:8px;padding:8px;background:#1e1e2e;border-radius:6px;'>
+  <b>总体状态：</b><span style='color:{oc};font-size:14px;'>{overall}</span><br>
+  <b>火势覆盖：</b>{fire_pct:.2f}% ({fire_cells} 格) &nbsp;&nbsp;
+  <b>烟雾覆盖：</b>{smoke_pct:.1f}% &nbsp;&nbsp;
+  <b>平均烟浓度：</b>{avg_smoke:.3f}<br>
+  <b>烟雾最大浓度：</b>{max_smoke:.3f}
+</div>
+
+<table style='width:100%;border-collapse:collapse;'>
+<thead style='background:#2d2d2d;color:#e0e0e0;'>
+<tr><th>出口</th><th>位置</th><th>状态</th><th>烟雾</th><th>火势</th><th>人流</th></tr>
+</thead>
+<tbody>
+{''.join(exit_lines)}
+</tbody>
+</table>
+</div>"""
+    return report
+
+
+# ================================================================
 # Build Gradio UI
 # ================================================================
 
@@ -577,13 +843,15 @@ def build_ui():
     # Create initial placeholder
     placeholder = _make_placeholder()
 
-    with gr.Blocks(title="LLM Evacuation Simulation", theme=gr.themes.Soft()) as demo:
-        gr.Markdown("# LLM-Powered Crowd Evacuation Simulation — Interactive Dashboard")
+    with gr.Blocks(title="LLM Evacuation Simulation", theme=gr.themes.Soft(),
+                   css="h1, .page-title { color: #1a56db !important; }") as demo:
+        gr.Markdown("<h1 class='page-title'>LLM-Powered Crowd Evacuation Simulation — Interactive Dashboard</h1>")
 
         # ---- Timers ----
         frame_timer = gr.Timer(2.0)
         stats_timer = gr.Timer(2.0)
         chart_timer = gr.Timer(5.0)
+        info_timer = gr.Timer(3.0)
 
         with gr.Row():
             with gr.Column(scale=3):
@@ -595,8 +863,23 @@ def build_ui():
                 frame_timer.tick(fn=get_latest_frame, outputs=frame_display)
 
             with gr.Column(scale=2):
-                stats_md = gr.Markdown(get_stats_text())
-                stats_timer.tick(fn=get_stats_text, outputs=stats_md)
+                # Tabs for different info views
+                with gr.Tabs():
+                    with gr.TabItem("📊 统计面板"):
+                        stats_md = gr.Markdown(get_stats_text())
+                        stats_timer.tick(fn=get_stats_text, outputs=stats_md)
+
+                    with gr.TabItem("🧑 Agent状态"):
+                        agent_table = gr.HTML(value=get_agent_status_table())
+                        info_timer.tick(fn=get_agent_status_table, outputs=agent_table)
+
+                    with gr.TabItem("🧠 LLM推理"):
+                        decision_html = gr.HTML(value=get_decision_log())
+                        info_timer.tick(fn=get_decision_log, outputs=decision_html)
+
+                    with gr.TabItem("🔥 火情烟雾"):
+                        fire_html = gr.HTML(value=get_fire_smoke_report())
+                        info_timer.tick(fn=get_fire_smoke_report, outputs=fire_html)
 
                 gr.Markdown("---")
                 gr.Markdown("### 自然语言查询")

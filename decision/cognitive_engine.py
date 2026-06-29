@@ -68,8 +68,9 @@ class LLMCognitiveEngine:
         self._vlm_description: str = ""
         self._yolo_result = None
 
-        # Async pipeline
-        self._pending_agents: Dict[str, Tuple[Agent, EnvironmentSnapshot]] = {}
+        # Async pipeline (producer-consumer chain)
+        # _pending_agents stores: (Agent, EnvironmentSnapshot, kdocs_map, rl_prefs)
+        self._pending_agents: Dict[str, tuple] = {}
         self._results: Dict[str, DecisionResult] = {}
         self._inference_thread: Optional[threading.Thread] = None
         self._inference_lock = threading.Lock()
@@ -119,7 +120,8 @@ class LLMCognitiveEngine:
         self._yolo_result = yolo_result
 
     def _build_messages(self, agent: Agent, env: EnvironmentSnapshot,
-                        knowledge_docs: List[str]) -> Tuple[list, str]:
+                        knowledge_docs: List[str],
+                        rl_preference: str = "") -> Tuple[list, str]:
         """Build chat messages. Returns (messages, group_key)."""
         role = agent.profile.role
         equipment = getattr(agent.profile, 'equipment', '')
@@ -131,6 +133,7 @@ class LLMCognitiveEngine:
             agent, env,
             vlm_description=self._vlm_description,
             yolo_result=self._yolo_result,
+            rl_preference=rl_preference,
         )
 
         # Group key: role + disaster_type for prefix caching
@@ -142,52 +145,92 @@ class LLMCognitiveEngine:
         ], group_key
 
     def submit_batch(self, agents: List[Agent], env: EnvironmentSnapshot,
-                     knowledge_docs_map: Optional[Dict[str, List[str]]] = None):
-        """Submit agents for async batch inference. NON-BLOCKING."""
+                     knowledge_docs_map: Optional[Dict[str, List[str]]] = None,
+                     rl_preferences: Optional[Dict[str, str]] = None):
+        """Submit agents for async batch inference. NON-BLOCKING.
+
+        v2.1: rl_preferences — per-agent RL zone scheduler advice text.
+
+        Architecture: producer-consumer chain.
+        - New agents are added to _pending_agents (dedup by agent ID).
+        - If no inference thread is running, _process_next_batch() is called
+          immediately to consume and submit.
+        - When inference finishes, _process_next_batch() is called again to
+          drain any agents that arrived while the GPU was busy. This forms
+          a self-draining chain — no agents are left buffered indefinitely.
+        """
         if not self._ready:
             return
 
-        # Buffer new agents while previous batch is still running
+        # Backpressure: cap pending to prevent unbounded growth
+        MAX_QUEUE = 600
+        with self._inference_lock:
+            current_pending = len(self._pending_agents)
+        if current_pending >= MAX_QUEUE:
+            return
+
+        # Buffer new agents (dedup)
         with self._inference_lock:
             for a in agents:
                 if a.id not in self._pending_agents:
-                    self._pending_agents[a.id] = (a, env)
+                    self._pending_agents[a.id] = (a, env, knowledge_docs_map, rl_preferences)
 
-        # If inference thread is busy, agents stay buffered for next round
+        # If worker is already running, agents are buffered — it will
+        # drain them when the current batch finishes.
         if self._inference_thread and self._inference_thread.is_alive():
             return
 
-        # Consume buffer
+        # Start the drain chain
+        self._process_next_batch()
+
+    def _process_next_batch(self):
+        """Consume all pending agents, format prompts, and launch inference.
+
+        Called from submit_batch (cold start) and from _run_inference
+        (chain continuation after previous batch finishes).
+        """
+        if not self._ready:
+            self._inference_thread = None
+            return
         with self._inference_lock:
+            if not self._pending_agents:
+                self._inference_thread = None
+                return
             pending = list(self._pending_agents.values())
             self._pending_agents.clear()
-
-        if not pending:
-            return
 
         # Build all messages
         all_formatted = []
         all_agents = []
-        for agent, env_snap in pending:
-            kdocs = knowledge_docs_map.get(env_snap.disaster_type, []) if knowledge_docs_map else []
-            msgs, _ = self._build_messages(agent, env_snap, kdocs)
+        for agent, env_snap, kdocs_map, rl_prefs in pending:
+            # Route knowledge: civilians get general, professionals get domain
+            if kdocs_map:
+                if agent.profile.role == "civilian":
+                    kdocs = kdocs_map.get("civilian", [])
+                else:
+                    kdocs = kdocs_map.get("professional", [])
+            else:
+                kdocs = []
+            rl_pref = rl_prefs.get(agent.id, "") if rl_prefs else ""
+            msgs, _ = self._build_messages(agent, env_snap, kdocs, rl_pref)
             all_formatted.append(msgs)
             all_agents.append(agent)
 
         if not all_agents:
+            self._inference_thread = None
             return
 
         formatted_prompts = self.tokenizer.apply_chat_template(
             all_formatted, tokenize=False, add_generation_prompt=True)
 
-        # Guard: ensure formatted prompts are valid before launching thread
         if not formatted_prompts or any(p is None for p in formatted_prompts):
-            print("[CogEngine] Skipping batch: malformed prompts detected, "
-                  "using fallback for all agents")
-            for agent in all_agents:
-                result = self._fallback_decision(agent, pending[0][1])
+            print("[CogEngine] Skipping batch: malformed prompts detected")
+            for agent, env_snap, _, _ in pending:
+                result = self._fallback_decision(agent, env_snap)
                 with self._inference_lock:
                     self._results[agent.id] = result
+            # Continue chain in case more agents arrived
+            self._process_next_batch()
             return
 
         self._inference_thread = threading.Thread(
@@ -198,7 +241,7 @@ class LLMCognitiveEngine:
         self._inference_thread.start()
 
     def _run_inference(self, formatted_prompts, agents, env):
-        """Background: run vLLM inference, store results."""
+        """Background: run vLLM inference, store results, chain to next batch."""
         try:
             t0 = time.time()
             outputs = self.llm.generate(formatted_prompts, self.sampling_params)
@@ -216,6 +259,11 @@ class LLMCognitiveEngine:
                 result = self._fallback_decision(agent, env)
                 with self._inference_lock:
                     self._results[agent.id] = result
+
+        # Chain: drain any agents that arrived while GPU was busy
+        # Only chain if still ready — shutdown() may have been called
+        if self._ready:
+            self._process_next_batch()
 
     def collect_results(self) -> Dict[str, DecisionResult]:
         """Collect finished decisions. Non-blocking."""
@@ -247,7 +295,8 @@ class LLMCognitiveEngine:
         target_exit_idx = 0
         target_pos = env.exits[0] if env.exits else (0.0, 0.0)
         exit_str = data.get("target_exit", "")
-        for i in range(1, len(env.exits) + 1):
+        # Iterate descending to avoid substring match (出口1 ≠ 出口12)
+        for i in range(len(env.exits), 0, -1):
             if f"出口{i}" in exit_str or f"exit{i}" in exit_str.lower():
                 target_exit_idx = i - 1
                 target_pos = env.exits[i - 1]
@@ -309,7 +358,32 @@ class LLMCognitiveEngine:
         )
 
     def shutdown(self):
-        """Clean up vLLM resources."""
+        """Clean up vLLM resources and free GPU memory (aggressive)."""
+        import torch
+        import gc
+        import subprocess
+        import time
+
         if self.llm:
-            del self.llm
+            try:
+                del self.llm
+            except Exception:
+                pass
+        self.llm = None
+        self.tokenizer = None
         self._ready = False
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+        # vLLM 0.21.0 spawns a separate EngineCore process that may
+        # survive del self.llm. Kill it explicitly to free GPU memory.
+        try:
+            subprocess.run(
+                ['pkill', '-f', 'EngineCore'],
+                capture_output=True, timeout=5)
+        except Exception:
+            pass
+        time.sleep(1.5)

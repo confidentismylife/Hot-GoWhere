@@ -49,7 +49,8 @@ def exit_color(status: str) -> tuple:
 
 
 class PygameRenderer:
-    def __init__(self, config: dict, world_w: float, world_h: float):
+    def __init__(self, config: dict, world_w: float, world_h: float,
+                 floorplan=None):
         self.world_w = world_w
         self.world_h = world_h
         self.screen_w = config.get("width", 1200)
@@ -60,6 +61,12 @@ class PygameRenderer:
         self.scale_x = self.screen_w / world_w
         self.scale_y = self.screen_h / world_h
 
+        # Floor plan walls (pre-rendered surface)
+        self.floorplan = floorplan
+        self._wall_surface = None
+        if floorplan:
+            self._build_wall_surface()
+
         self.screen = None
         self.clock = None
         self.font = None
@@ -68,6 +75,34 @@ class PygameRenderer:
         # Trail tracking (agent ID → last N positions)
         self.trails = {}
         self._running = True
+
+    def _build_wall_surface(self):
+        """Pre-render wall grid to a pygame surface for fast blitting."""
+        import pygame
+        fp = self.floorplan
+        grid = fp.grid
+        rows, cols = grid.shape
+        cell_w = cols / self.screen_w
+        cell_h = rows / self.screen_h
+
+        # Create a surface the size of the screen
+        self._wall_surface = pygame.Surface((self.screen_w, self.screen_h),
+                                            pygame.SRCALPHA)
+
+        # Draw wall cells
+        wall_color = (120, 120, 125, 255)
+        for r in range(rows):
+            for c in range(cols):
+                if grid[r, c] == 1:
+                    # Grid coords → world coords → screen coords
+                    wx = (c + 0.5) * fp.width / cols
+                    wy = (r + 0.5) * fp.height / rows
+                    sx = int(wx * self.scale_x)
+                    sy = int(wy * self.scale_y)
+                    # Cell size in screen pixels
+                    cs = max(1, int(fp.width / cols * self.scale_x))
+                    pygame.draw.rect(self._wall_surface, wall_color,
+                                     (sx - cs // 2, sy - cs // 2, cs, cs))
 
     def initialize(self):
         import pygame
@@ -99,7 +134,14 @@ class PygameRenderer:
                     return False
 
         # Background
-        self.screen.fill((240, 240, 245))
+        if self.floorplan:
+            self.screen.fill((230, 225, 215))  # Warm mall floor color
+        else:
+            self.screen.fill((240, 240, 245))
+
+        # --- Floor plan walls ---
+        if self._wall_surface:
+            self.screen.blit(self._wall_surface, (0, 0))
 
         # --- Disaster overlay (smoke grid) ---
         self._draw_smoke_overlay(env)

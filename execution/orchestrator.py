@@ -9,6 +9,7 @@ Runs on a single machine (4090 GPU). Core loop:
   6. Visualize: render frame
 """
 
+import os
 import time
 import random
 import yaml
@@ -23,6 +24,9 @@ from decision.agent_roles import AgentRole, define_zones
 from perception.environment import DisasterSimulator, EnvironmentSnapshot
 from execution.batched_physics import BatchedPhysics
 from execution.diffusion_policy import build_scene_map
+from execution.irl_recovery import TrajectoryCollector
+from execution.rl_scheduler import RLZoneScheduler, inject_rl_preferences, DEFAULT_ZONES
+from execution.tactical_layer import TacticalLayer
 from group_intel.propagation import GroupIntelligence
 
 
@@ -45,22 +49,47 @@ class SimulationOrchestrator:
         self.decision_interval = sim["decision_interval"]
         self.decision_ticks = int(self.decision_interval / self.dt)
         self.seed = sim["seed"]
+        self.enable_command_agents = sim.get("enable_command_agents", True)
         random.seed(self.seed)
         np.random.seed(self.seed)
 
+        # Floor plan support (mall layout)
+        self.floorplan = None
+        if env.get("type") == "mall" or env.get("floorplan"):
+            from perception.floorplan import get_floorplan
+            fp_name = env.get("floorplan", "chaoyang_joycity_1f")
+            self.floorplan = get_floorplan(fp_name)
+            print(f"[Orchestrator] Loaded floor plan: {self.floorplan.name}")
+
         # Environment dimensions
-        self.width = env["width"]
-        self.height = env["height"]
-        self.exits = [tuple(e) for e in env["exit_positions"]]
-        self.obstacles = env.get("obstacles", [])
+        if self.floorplan:
+            self.width = self.floorplan.width
+            self.height = self.floorplan.height
+            # Config exit_positions can override floorplan exits (for experiments)
+            if env.get("exit_positions"):
+                self.exits = [tuple(e) for e in env["exit_positions"]]
+                print(f"[Orchestrator] Using config exit overrides: {len(self.exits)} exits")
+            else:
+                self.exits = self.floorplan.exits
+            # Merge floor plan obstacles with config obstacles
+            self.obstacles = self.floorplan.obstacles + env.get("obstacles", [])
+        else:
+            self.width = env["width"]
+            self.height = env["height"]
+            self.exits = [tuple(e) for e in env["exit_positions"]]
+            self.obstacles = env.get("obstacles", [])
 
         # Disaster
+        disaster_origin = env.get("disaster_origin", (self.width * 0.2, self.height * 0.5))
+        if self.floorplan and env.get("disaster_origin") is None:
+            disaster_origin = self.floorplan.disaster_origin_default
         self.disaster = DisasterSimulator(
             width=self.width, height=self.height,
             disaster_type=env["disaster"],
-            origin=tuple(env["disaster_origin"]),
+            origin=tuple(disaster_origin),
             spread_rate=env["disaster_spread_rate"],
             resolution=0.5,
+            wall_mask=(self.floorplan.grid if self.floorplan else None),
         )
 
         # LLM Engine
@@ -70,8 +99,10 @@ class SimulationOrchestrator:
         )
 
         # Physics (batched, all agents in one JIT call)
+        wall_grid = self.floorplan.grid if self.floorplan else None
         self.physics = BatchedPhysics(
-            width=self.width, height=self.height, obstacles=self.obstacles
+            width=self.width, height=self.height,
+            obstacles=self.obstacles, wall_grid=wall_grid,
         )
 
         # Group intelligence
@@ -97,6 +128,20 @@ class SimulationOrchestrator:
         self._command_broadcasts = []  # Commander-generated broadcasts (injected into civilian prompts)
         self._kb_cache: Dict[str, List[str]] = {}  # Cache KB queries
         self._kb_cache_tick: int = -999
+
+        # IRL/Reward data collection (LLM → IRL → RL cascade)
+        irl_cfg = self.cfg.get("irl", {})
+        self.enable_irl_collection = irl_cfg.get("enabled", False)
+        self.trajectory_collector: Optional[TrajectoryCollector] = None
+        self.irl_output_dir = irl_cfg.get("output_dir", "data/trajectories")
+
+        # RL zone scheduling
+        rl_cfg = self.cfg.get("rl_scheduling", {})
+        self.enable_rl_scheduling = rl_cfg.get("enabled", False)
+        self.zone_scheduler: Optional[RLZoneScheduler] = None
+        self._rl_zones = DEFAULT_ZONES  # May be overridden by YAML config
+        self._zone_actions = None  # Cached per-tick zone actions
+        self._rl_preferences_cache: Dict[str, str] = {}  # agent_id → NL advice
 
     # ================================================================
     # Agent Generation
@@ -164,11 +209,15 @@ class SimulationOrchestrator:
         )
 
     def _random_dynamic(self, profile: AgentProfile) -> AgentDynamic:
-        # Random starting position (avoid obstacles and exits)
-        while True:
+        # Random starting position (avoid walls, obstacles and exits)
+        for _ in range(1000):  # Safety limit
             x = random.uniform(5, self.width - 5)
             y = random.uniform(5, self.height - 5)
             pos = np.array([x, y], dtype=np.float64)
+
+            # Check not inside floor plan wall
+            if self.floorplan and not self.floorplan.is_walkable(x, y):
+                continue
 
             # Check not inside obstacle
             blocked = False
@@ -184,12 +233,33 @@ class SimulationOrchestrator:
         num_known = max(1, int(profile.familiarity * len(self.exits)))
         known = random.sample(self.exits, num_known)
 
+        # Seed initial target: score known exits by distance + fire risk.
+        # Exits near the fire origin get heavily penalized because they'll
+        # be smoked soon. Agents start moving immediately with a reasonable
+        # target while waiting for first LLM response.
+        fire_origin = np.array(
+            self.cfg["environment"].get("disaster_origin", (self.width/2, self.height/2)),
+            dtype=np.float64)
+        best_exit = known[0]
+        best_score = float('inf')
+        for ex in known:
+            ex_arr = np.array(ex, dtype=np.float64)
+            dist = float(np.linalg.norm(pos - ex_arr))
+            dist_to_fire = float(np.linalg.norm(ex_arr - fire_origin))
+            fire_risk = max(0.0, 1.0 - dist_to_fire / 40.0)
+            score = dist * (1.0 + fire_risk * 4.0)
+            if score < best_score:
+                best_score = score
+                best_exit = ex
         return AgentDynamic(
             position=pos,
+            target_exit=np.array(best_exit, dtype=np.float64),
+            speed_choice=Speed.WALK,
+            cooperation_choice=Cooperation.NONE,
             stamina=random.uniform(60, 100),
             trust_official_now=profile.trust_authority,
             known_exit_positions=known,
-            has_new_info=True,  # Will trigger initial decision
+            has_new_info=True,  # Will trigger initial LLM decision
         )
 
     def _create_family_groups(self):
@@ -380,6 +450,7 @@ class SimulationOrchestrator:
 
     def run(self):
         """Execute the full simulation with multi-role agents."""
+        self.use_llm = self.cfg.get("llm", {}).get("enabled", True)
         self.use_vlm = self.cfg.get("vlm", {}).get("enabled", False)
         self.use_diffusion = self.cfg.get("diffusion", {}).get("enabled", False)
 
@@ -392,8 +463,16 @@ class SimulationOrchestrator:
 
         # Initialize
         self.generate_agents()
-        self._spawn_command_agents()
-        self.llm_engine.initialize()
+        if self.enable_command_agents:
+            self._spawn_command_agents()
+        if self.use_llm:
+            self.llm_engine.initialize()
+
+        # IRL trajectory collection
+        if self.enable_irl_collection:
+            self.trajectory_collector = TrajectoryCollector()
+            print(f"[Orchestrator] IRL trajectory collection ENABLED → "
+                  f"{self.irl_output_dir}")
 
         # v2: VLM 感知器 + YOLO 检测器 (双通道，独立开关)
         self.vlm = None
@@ -446,20 +525,50 @@ class SimulationOrchestrator:
             self.diffusion_policy = DiffusionPolicy(self.cfg)
             self.diffusion_policy.initialize()
 
+        # v2.1: RL zone scheduler (LLM → IRL → RL cascade)
+        if self.enable_rl_scheduling:
+            rl_cfg = self.cfg.get("rl_scheduling", {})
+            self._rl_zones = self._load_zones_from_config()
+            self.zone_scheduler = RLZoneScheduler(
+                zones=self._rl_zones,
+                num_exits=len(self.exits),
+            )
+            pretrained = rl_cfg.get("pretrained_weights")
+            self.zone_scheduler.initialize(
+                pretrained_path=pretrained if pretrained else None
+            )
+            # Load IRL weights if available
+            irl_weights_path = rl_cfg.get("irl_weights")
+            if irl_weights_path and os.path.exists(irl_weights_path):
+                from execution.irl_recovery import IRLRecovery
+                irl = IRLRecovery()
+                irl.load(irl_weights_path)
+                self.zone_scheduler.load_irl_weights(irl.weights)
+            print(f"[Orchestrator] RL zone scheduling ENABLED "
+                  f"({len(self._rl_zones)} zones, {len(self.exits)} exits)")
+
         total_ticks = int(self.duration / self.dt)
         vis = None
 
         vis_cfg = self.cfg.get("visualization", {})
         if vis_cfg.get("mode") == "headless":
-            from visualization.headless_renderer import HeadlessRenderer
-            vis = HeadlessRenderer(
-                frame_interval=vis_cfg.get("frame_interval", 10)
-            )
-            vis.initialize(self.width, self.height)
+            try:
+                from visualization.headless_renderer import HeadlessRenderer
+                vis = HeadlessRenderer(
+                    frame_interval=vis_cfg.get("frame_interval", 10),
+                    floorplan=self.floorplan,
+                )
+                vis.initialize(self.width, self.height)
+            except ImportError:
+                vis = None
         elif vis_cfg.get("enabled", True):
-            from visualization.renderer import PygameRenderer
-            vis = PygameRenderer(vis_cfg, self.width, self.height)
-            vis.initialize()
+            try:
+                from visualization.renderer import PygameRenderer
+                vis = PygameRenderer(vis_cfg, self.width, self.height,
+                                     floorplan=self.floorplan)
+                vis.initialize()
+            except ImportError:
+                vis = None
 
         print(f"[Orchestrator] Starting simulation: "
               f"{total_ticks} ticks, {self.duration}s, dt={self.dt}s")
@@ -474,34 +583,39 @@ class SimulationOrchestrator:
 
             # ---- 1. Perception ----
             self.disaster.step(self.dt)
+
+            # Compute exit crowd counts for LLM strategic context (v2.2)
+            exit_crowd_counts = [0] * len(self.exits)
+            for a in self.agents:
+                if (a.dynamic.alive and not a.dynamic.evacuated
+                        and a.dynamic.target_exit is not None):
+                    tgt = a.dynamic.target_exit
+                    best_i = 0
+                    best_d = float('inf')
+                    for i, ex in enumerate(self.exits):
+                        d = float(np.linalg.norm(tgt - np.array(ex, dtype=np.float64)))
+                        if d < best_d:
+                            best_d = d
+                            best_i = i
+                    if best_d < 2.0:  # within 2m of an exit → counted as heading there
+                        exit_crowd_counts[best_i] += 1
+
             env_snapshot = self.disaster.snapshot(
                 self.tick, self.sim_time, self.exits, self.obstacles,
-                official_broadcast=self._get_broadcast()
+                official_broadcast=self._get_broadcast(),
+                exit_crowd_counts=exit_crowd_counts,
             )
 
-            # ---- 2. Cognition (async LLM inference) ----
-            agents_to_decide = [
-                a for a in self.agents
-                if (a.dynamic.alive and not a.dynamic.evacuated and
-                    (a.dynamic.has_new_info or
-                     self.tick - a.dynamic.last_decision_tick >= self.decision_ticks))
-            ]
+            # ---- 1.5 RL Zone Scheduling (LLM → IRL → RL cascade) ----
+            if self.enable_rl_scheduling and self.zone_scheduler is not None:
+                self._zone_actions = self.zone_scheduler.infer(
+                    env_snapshot, self.agents, self.tick)
+            else:
+                self._zone_actions = None
+                self._rl_preferences_cache.clear()
 
-            if agents_to_decide:
-                # Cache KB query (knowledge docs don't change mid-simulation)
-                if self.tick - self._kb_cache_tick > 30:
-                    self._kb_cache[self.cfg['environment']['disaster']] = \
-                        self.knowledge_base.query(
-                            f"{self.cfg['environment']['disaster']}疏散决策",
-                            disaster_type=self.cfg['environment']['disaster'],
-                            top_k=3)
-                    self._kb_cache_tick = self.tick
-                kdocs_map = {self.cfg['environment']['disaster']:
-                             self._kb_cache.get(self.cfg['environment']['disaster'], [])}
-
-                self.llm_engine.submit_batch(agents_to_decide, env_snapshot, kdocs_map)
-            # ---- 3. Collect LLM results ----
-            decisions = self.llm_engine.collect_results()
+            # ---- 2. Collect LLM results from previous batch FIRST ----
+            decisions = self.llm_engine.collect_results() if self.use_llm else {}
             if decisions:
                 # Separate civilian vs command decisions
                 civilian_decisions = {}
@@ -515,6 +629,9 @@ class SimulationOrchestrator:
 
                 self.decision_count += len(decisions)
                 self.total_llm_time += sum(d.compute_time for d in decisions.values())
+                if self.tick % 50 == 0:
+                    print(f"[LLM collect] tick={self.tick} collected={len(decisions)} "
+                          f"total_llm_time={self.total_llm_time:.1f}s")
 
                 # Apply civilian decisions normally
                 if civilian_decisions:
@@ -523,6 +640,104 @@ class SimulationOrchestrator:
                 # Process command decisions → generate broadcasts
                 if command_decisions:
                     self._apply_command_decisions(command_decisions, env_snapshot)
+
+            # ---- 3. Cognition: compute agents that need re-decision ----
+            agents_to_decide = [
+                a for a in self.agents
+                if (a.dynamic.alive and not a.dynamic.evacuated and
+                    (a.dynamic.has_new_info or
+                     self.tick - a.dynamic.last_decision_tick >= self.decision_ticks))
+            ]
+
+            # ---- 3.1 Criticality Filter: Brain-Torso split ----
+            # ALL agents get heuristic decisions immediately (no waiting).
+            # Critical agents are ALSO submitted to LLM for strategic refinement;
+            # when the LLM response arrives later, it overrides the heuristic.
+            # NOTE: is_critical must be checked BEFORE _apply_decisions clears has_new_info.
+            if self.use_llm and agents_to_decide:
+                critical = [a for a in agents_to_decide
+                           if TacticalLayer.is_critical(a, env_snapshot, self.tick, self.decision_ticks)]
+
+                # Give every agent an immediate heuristic decision
+                heur_decisions = {}
+                for agent in agents_to_decide:
+                    heur_decisions[agent.id] = TacticalLayer.heuristic_decision(
+                        agent, env_snapshot, self.exits)
+                if heur_decisions:
+                    self._apply_decisions(heur_decisions, env_snapshot)
+                    self.decision_count += len(heur_decisions)
+
+                # Only critical agents get LLM strategic refinement
+                agents_to_decide = critical
+
+            # ---- 3.5 Heuristic Fallback (when LLM disabled) ----
+            if not self.use_llm and agents_to_decide:
+                heur_decisions = {}
+                for agent in agents_to_decide:
+                    pos = agent.dynamic.position
+                    best_exit_idx = 0
+                    best_score = float('inf')
+                    for i, ex in enumerate(self.exits):
+                        ex_arr = np.array(ex, dtype=np.float64)
+                        dist = np.linalg.norm(pos - ex_arr)
+                        smoke = env_snapshot.smoke_at(ex_arr)
+                        if smoke > 0.8:
+                            continue
+                        score = dist * (1.0 + smoke * 3.0)
+                        if score < best_score:
+                            best_score = score
+                            best_exit_idx = i
+                    local_smoke = env_snapshot.smoke_at(pos)
+                    if local_smoke > 0.6:
+                        spd = Speed.CRAWL
+                    elif local_smoke > 0.3:
+                        spd = Speed.WALK
+                    else:
+                        spd = Speed.WALK
+                    d = DecisionResult(
+                        agent_id=agent.id,
+                        target_exit_idx=best_exit_idx,
+                        target_exit_pos=tuple(self.exits[best_exit_idx]),
+                        speed=spd,
+                        cooperation=Cooperation.NONE,
+                        reasoning=f"[SFM] exit {best_exit_idx+1}",
+                        risk_assessment="low",
+                        compute_time=0.0,
+                    )
+                    heur_decisions[agent.id] = d
+                if heur_decisions:
+                    self._apply_decisions(heur_decisions, env_snapshot)
+
+            # ---- 3.6 RL advice for agents that will decide ----
+            if self._zone_actions is not None and agents_to_decide:
+                self._rl_preferences_cache.clear()
+                for agent in agents_to_decide:
+                    advice = inject_rl_preferences(
+                        self._zone_actions, self._rl_zones,
+                        agent, env_snapshot)
+                    if advice:
+                        self._rl_preferences_cache[agent.id] = advice
+
+            # ---- 4. Cognition: submit new agents for async LLM inference ----
+            if agents_to_decide and self.use_llm:
+                if self.tick - self._kb_cache_tick > 30:
+                    d_type = self.cfg['environment']['disaster']
+                    self._kb_cache["professional"] = \
+                        self.knowledge_base.query(
+                            f"{d_type}疏散决策", disaster_type=d_type, top_k=3)
+                    self._kb_cache["civilian"] = \
+                        self.knowledge_base.query(
+                            "通用安全常识", disaster_type="general", top_k=3)
+                    self._kb_cache_tick = self.tick
+                kdocs_map = {
+                    "professional": self._kb_cache.get("professional", []),
+                    "civilian": self._kb_cache.get("civilian", []),
+                }
+
+                self.llm_engine.submit_batch(
+                    agents_to_decide, env_snapshot, kdocs_map,
+                    rl_preferences=(self._rl_preferences_cache
+                                    if self.enable_rl_scheduling else None))
 
             # ---- 3.5 VLM + YOLO 双通道感知 (v2.0) ----
             frame = None
@@ -544,7 +759,7 @@ class SimulationOrchestrator:
                 yolo_res = self.yolo.detect(frame)
                 dirty = True
 
-            if dirty:
+            if dirty and self.use_llm:
                 self.llm_engine.set_perception_context(vlm_desc, yolo_res)
 
             # ---- 4. Group Intelligence ----
@@ -553,6 +768,9 @@ class SimulationOrchestrator:
                 env_snapshot.official_broadcast, self.dt)
             self.group_intel.update_fear_levels(self.agents, env_snapshot, self.dt)
             self.group_intel.update_stamina(self.agents, self.dt)
+
+            # ---- 4.5 Tactical Layer (Brain-Torso: per-tick reactive adjustments) ----
+            TacticalLayer.adjust_all(self.agents, env_snapshot, self.exits, self.tick)
 
             # ---- 5. Physics ----
             if self.use_diffusion and self.diffusion_policy is not None:
@@ -616,7 +834,18 @@ class SimulationOrchestrator:
         if self.diffusion_policy is not None:
             self.diffusion_policy.shutdown()
 
-        self.llm_engine.shutdown()
+        if self.use_llm:
+            self.llm_engine.shutdown()
+
+        # Save IRL trajectory data
+        if self.trajectory_collector is not None:
+            self.trajectory_collector.finalize(self.agents, dt=self.dt)
+            import datetime
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            traj_path = os.path.join(self.irl_output_dir, f"run_{ts}.jsonl")
+            self.trajectory_collector.save(traj_path)
+            print(f"[Orchestrator] Trajectories saved to {traj_path}")
+
         self._print_summary(tick_times)
 
     def _apply_decisions(self, decisions: Dict[str, DecisionResult],
@@ -701,9 +930,35 @@ class SimulationOrchestrator:
             if len(agent.dynamic.memory_events) > 20:
                 agent.dynamic.memory_events = agent.dynamic.memory_events[-20:]
 
+            # Record trajectory for IRL (if collection enabled)
+            if self.trajectory_collector is not None and env_snapshot is not None:
+                blocked = (safety is not None and not safety.passed)
+                modified = (safety is not None and safety.modified)
+                self.trajectory_collector.record_decision(
+                    agent, d, env_snapshot, blocked, modified)
+
     def _find_agent(self, agent_id: str):
         """Find agent by ID. Returns None if not found. O(1) via lookup dict."""
         return self._agent_lookup.get(agent_id)
+
+    def _load_zones_from_config(self):
+        """Load zone definitions from YAML config, falling back to DEFAULT_ZONES."""
+        zones_cfg = self.cfg.get("zones")
+        if not zones_cfg or not isinstance(zones_cfg, list):
+            return DEFAULT_ZONES
+        from execution.rl_scheduler import ZoneDefinition
+        zones = []
+        for z in zones_cfg:
+            zones.append(ZoneDefinition(
+                zone_id=z["id"],
+                name=z.get("name", f"Zone{z['id']}"),
+                x_min=z["x_min"], x_max=z["x_max"],
+                y_min=z["y_min"], y_max=z["y_max"],
+                primary_exits=z.get("primary_exits", list(range(len(self.exits)))),
+                description=z.get("description", ""),
+            ))
+        print(f"[Orchestrator] Loaded {len(zones)} zone definitions from config")
+        return zones
 
     def _rebuild_lookup(self):
         """Rebuild agent ID → agent dict. Call after spawning agents."""
@@ -771,7 +1026,8 @@ class SimulationOrchestrator:
                 call = data.get("call_for_followers", True)
 
                 # Determine which exit the guide is leading to
-                for i in range(1, len(env_snapshot.exits) + 1):
+                # Iterate descending to avoid substring matches (出口1 ≠ 出口12)
+                for i in range(len(env_snapshot.exits), 0, -1):
                     if f"出口{i}" in exit_str:
                         agent.dynamic.target_exit = np.array(
                             env_snapshot.exits[i - 1], dtype=np.float64
@@ -794,6 +1050,11 @@ class SimulationOrchestrator:
 
             agent.dynamic.last_decision_tick = self.tick
             agent.dynamic.has_new_info = False
+
+            # Record command agent trajectory for IRL
+            if self.trajectory_collector is not None:
+                self.trajectory_collector.record_decision(
+                    agent, d, env_snapshot, False, False)
 
     # ================================================================
     # v2.0: 扩散模型轨迹播放
@@ -889,6 +1150,74 @@ class SimulationOrchestrator:
         return frame
 
     # ================================================================
+    # RL Training Mode (offline, no LLM)
+    # ================================================================
+
+    def train_rl_scheduler(self, episodes: int = 500,
+                           irl_weights_path: str = "data/irl_weights.json",
+                           output_path: str = "data/rl_policy.json"):
+        """Run offline RL training using a fast rule-based simulator.
+
+        This trains the RL zone scheduler without running the full LLM simulation.
+        Uses IRL-learned weights as the reward function.
+
+        Args:
+            episodes: Number of training episodes.
+            irl_weights_path: Path to IRL-learned reward weights.
+            output_path: Where to save trained policy weights.
+        """
+        from execution.rl_scheduler import (
+            RLZoneScheduler, FastTrainingSimulator, DEFAULT_ZONES,
+        )
+        from execution.irl_recovery import IRLRecovery
+
+        print("\n" + "=" * 60)
+        print("   RL Zone Scheduler — Offline Training (P-MAPPO)")
+        print("=" * 60)
+
+        zones = self._load_zones_from_config()
+
+        scheduler = RLZoneScheduler(zones=zones, num_exits=len(self.exits))
+        scheduler.initialize()
+
+        # Load IRL weights
+        if os.path.exists(irl_weights_path):
+            irl = IRLRecovery()
+            irl.load(irl_weights_path)
+            scheduler.load_irl_weights(irl.weights)
+            print(f"[TrainRL] Loaded IRL weights for {len(irl.weights)} personas")
+        else:
+            print(f"[TrainRL] IRL weights not found at {irl_weights_path}, "
+                  f"using default balanced weights")
+
+        # Create fast training simulator with real mall floor plan exits
+        sim = FastTrainingSimulator(
+            width=self.width,
+            height=self.height,
+            num_agents=self.num_agents,
+            num_exits=len(self.exits),
+            zone_defs=zones,
+            exit_positions=[(float(e[0]), float(e[1])) for e in self.exits],
+        )
+
+        print(f"[TrainRL] Simulator: {self.width}×{self.height}m, "
+              f"{self.num_agents} agents, {len(self.exits)} exits, "
+              f"{len(zones)} zones")
+        print(f"[TrainRL] Training: {episodes} episodes")
+
+        history = scheduler.train_offline(
+            env_simulator=sim,
+            episodes=episodes,
+            steps_per_episode=int(self.duration / self.dt),
+            save_path=output_path,
+        )
+
+        print(f"\n[TrainRL] Training complete. "
+              f"Final evacuation rate: {history['evacuation_rate'][-1]:.1%}")
+        print(f"[TrainRL] Policy weights saved to {output_path}")
+        print("=" * 60)
+
+    # ================================================================
     # Summary
     # ================================================================
 
@@ -900,12 +1229,14 @@ class SimulationOrchestrator:
         print(f"  Ticks:            {self.tick}")
         print(f"  Avg tick time:    {np.mean(tick_times):.1f}ms")
         print(f"  Max tick time:    {np.max(tick_times):.1f}ms")
-        civilian_n = self.num_agents
-        print(f"  Total agents:     {len(self.agents)} (civilian: {civilian_n})")
+        total_n = max(1, self.evacuated_count + self.casualty_count
+                      + sum(1 for a in self.agents
+                            if a.dynamic.alive and not a.dynamic.evacuated))
+        print(f"  Total agents:     {len(self.agents)} (active: {total_n})")
         print(f"  Evacuated:        {self.evacuated_count} "
-              f"({self.evacuated_count/civilian_n*100:.1f}%)")
+              f"({self.evacuated_count/total_n*100:.1f}%)")
         print(f"  Casualties:       {self.casualty_count} "
-              f"({self.casualty_count/civilian_n*100:.1f}%)")
+              f"({self.casualty_count/total_n*100:.1f}%)")
         print(f"  LLM decisions:    {self.decision_count}")
         print(f"  Safety blocked:   {self.safety_blocks}")
         print(f"  Safety modified:  {self.safety_modifications}")

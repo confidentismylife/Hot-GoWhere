@@ -112,15 +112,15 @@ class GroupIntelligence:
             d = agent.dynamic
 
             if d.speed_choice.value == "run":
-                d.stamina -= 5.0 * dt
+                d.stamina -= 1.0 * dt
             elif d.speed_choice.value == "walk":
-                d.stamina -= 0.5 * dt
+                d.stamina -= 0.3 * dt
             elif d.speed_choice.value == "wait":
                 d.stamina += 2.0 * dt
             if agent.profile.age > 60:
-                d.stamina -= 1.0 * dt
+                d.stamina -= 0.5 * dt
             if d.has_children:
-                d.stamina -= 1.5 * dt
+                d.stamina -= 0.5 * dt
 
             d.stamina = max(0.0, min(100.0, d.stamina))
             if d.stamina <= 0 and random.random() < 0.01 * dt:
@@ -145,7 +145,8 @@ class GroupIntelligence:
             if len(d.received_rumors) > 5:
                 d.received_rumors = d.received_rumors[-5:]
 
-        # Only trigger re-decision if this is genuinely new info
-        # (broadcasts & peer exchanges are too frequent to re-decide every time)
-        if credibility > 0.8:  # Only high-credibility info triggers re-decision
+        # Only trigger re-decision on critical alerts (credibility >= 0.95).
+        # Broadcasts (0.9) and peer exchanges (<0.8) should NOT trigger
+        # immediate re-decision, or they fragment the vLLM batch into tiny pieces.
+        if credibility >= 0.95:
             d.has_new_info = True

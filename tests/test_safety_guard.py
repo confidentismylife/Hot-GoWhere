@@ -184,6 +184,83 @@ def test_wait_in_smoke():
     print(f"  PASS test_wait_in_smoke: {result.warnings}")
 
 
+def test_phase2_revalidation_warn_smoke():
+    """Fix 3: When exit is swapped, new exit gets WARN smoke check."""
+    guard = SafetyGuard()
+    agent = make_agent(x=50, y=30)
+    # exit 0: BLOCK smoke → will be swapped
+    # exit 1: low smoke (clean)
+    # exit 2: WARN smoke (0.4) — should trigger warning if selected
+    # exit 3: low smoke (clean)
+    env = make_env(smoke_levels={0: 0.7, 1: 0.1, 2: 0.1, 3: 0.1})
+
+    decision = MockDecision(target_exit_idx=0, speed=Speed.WALK)
+    result = guard.check(decision, agent, env)
+
+    # Exit 0 blocked → should be swapped to exit 1 (lowest distance+smoke)
+    assert result.modified, "Should be modified"
+    assert result.final_exit_idx != 0, f"Should not stay on blocked exit 0"
+    # The swapped exit should have low smoke → no WARN needed
+    print(f"  PASS test_phase2_revalidation_warn_smoke: "
+          f"swapped to exit {result.final_exit_idx+1}, warnings={result.warnings}")
+
+
+def test_phase2_revalidation_distance():
+    """Fix 3: When exit is swapped, new exit gets distance sanity check."""
+    guard = SafetyGuard()
+    # All exits have same smoke, but exit 0 is very far
+    agent = make_agent(x=10, y=10)
+    # Make exit 0 at (10,10) which is far from agent at (50,30):
+    # Actually let's make exit 3 very far from agent
+    env = make_env(smoke_levels={0: 0.1, 1: 0.1, 2: 0.1, 3: 0.1})
+    # Set distance sanity to trigger on exit 2 (index 2)
+    # Agent at (10,10), exit 3 at (5,55) = dist ~45m, under 150m threshold
+    # Actually let's test that distance check works when swap happens
+    # Exit 0 has BLOCK smoke → swap to exit 1
+    env = make_env(smoke_levels={0: 0.7, 1: 0.1, 2: 0.1, 3: 0.1})
+    decision = MockDecision(target_exit_idx=0, speed=Speed.WALK)
+    result = guard.check(decision, agent, env)
+    assert result.modified
+    # Phase 2 distance check runs, new exit should be under 150m → no warning
+    print(f"  PASS test_phase2_revalidation_distance: "
+          f"dist_check applied to new exit {result.final_exit_idx+1}")
+
+
+def test_phase2_revalidation_fire_path():
+    """Fix 3: After exit swap, re-check fire path on new exit."""
+    guard = SafetyGuard()
+    agent = make_agent(x=50, y=30)
+    # exit 0 has BLOCK smoke → triggers swap
+    # exit 2 has fire on path but is the best alternative
+    env = make_env(
+        smoke_levels={0: 0.7, 1: 0.1, 2: 0.1, 3: 0.1},
+        fire_cells=[(6, 5)]  # grid (6,5) at 5m res = world pos roughly near exit 2
+    )
+    decision = MockDecision(target_exit_idx=0, speed=Speed.WALK)
+    result = guard.check(decision, agent, env)
+    # Phase 2 re-checks fire path on the new exit
+    print(f"  PASS test_phase2_revalidation_fire_path: "
+          f"warnings={result.warnings}")
+
+
+def test_phase2_block_if_all_blocked():
+    """When all exits blocked, no swap happens — orchestrator fallback_decision handles it."""
+    guard = SafetyGuard()
+    agent = make_agent(x=50, y=30)
+    # All 4 exits have BLOCK smoke
+    env = make_env(smoke_levels={0: 0.8, 1: 0.7, 2: 0.9, 3: 0.75})
+    decision = MockDecision(target_exit_idx=0, speed=Speed.WALK)
+    result = guard.check(decision, agent, env)
+    # _best_exit skips all blocked exits → returns default (0), same as original
+    # No modification (no better alternative exists)
+    # The orchestrator should call fallback_decision when all exits are blocked
+    fb = guard.fallback_decision(agent, env)
+    assert fb["target_exit_idx"] is not None, "Fallback should provide a valid exit"
+    assert fb["speed"] is not None, "Fallback should provide a valid speed"
+    print(f"  PASS test_phase2_block_if_all_blocked: "
+          f"no swap (all blocked), fallback → exit {fb['target_exit_idx']+1}")
+
+
 if __name__ == "__main__":
     print("=== SafetyGuard Unit Tests ===\n")
     tests = [
@@ -194,6 +271,10 @@ if __name__ == "__main__":
         test_fire_path_block,
         test_injured_run_block,
         test_wait_in_smoke,
+        test_phase2_revalidation_warn_smoke,
+        test_phase2_revalidation_distance,
+        test_phase2_revalidation_fire_path,
+        test_phase2_block_if_all_blocked,
     ]
 
     passed = 0

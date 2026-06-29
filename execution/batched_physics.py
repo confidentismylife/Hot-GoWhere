@@ -34,6 +34,10 @@ def _step_all(
     # Obstacles
     obs_x, obs_y,           # float64[K]
     obs_radius,             # float64[K]
+    # Wall grid (floor plan walls)
+    wall_grid,              # int32[wg_rows * wg_cols] — flattened, 1=wall, 0=walkable
+    wg_rows, wg_cols,       # int32
+    wall_resolution,        # float64 — meters per wall grid cell
     # Environment
     width, height,          # float64
     tau,                    # float64
@@ -200,6 +204,37 @@ def _step_all(
             F_ox += f * nx
             F_oy += f * ny
 
+        # --- Force 3.5: Wall grid repulsion (floor plan walls) ---
+        if wall_grid.shape[0] > 0:
+            F_wx = 0.0
+            F_wy = 0.0
+            # Check cells within 2m of agent
+            w_cells = max(1, int(2.0 / wall_resolution))
+            w_col = int(px / wall_resolution)
+            w_row = int(py / wall_resolution)
+            for wdr in range(-w_cells, w_cells + 1):
+                for wdc in range(-w_cells, w_cells + 1):
+                    wr = w_row + wdr
+                    wc = w_col + wdc
+                    if wr < 0 or wr >= wg_rows or wc < 0 or wc >= wg_cols:
+                        continue
+                    if wall_grid[wr * wg_cols + wc] == 1:
+                        wx = (wc + 0.5) * wall_resolution
+                        wy = (wr + 0.5) * wall_resolution
+                        dx_w = px - wx
+                        dy_w = py - wy
+                        d_w = np.sqrt(dx_w * dx_w + dy_w * dy_w)
+                        if d_w < 1e-6:
+                            d_w = 0.01
+                        if d_w < 1.5:
+                            nx_w = dx_w / d_w
+                            ny_w = dy_w / d_w
+                            f_w = 15000.0 * (1.5 - d_w)
+                            F_wx += f_w * nx_w
+                            F_wy += f_w * ny_w
+            F_ox += F_wx
+            F_oy += F_wy
+
         # --- Force 4: Boundary ---
         F_bx = 0.0
         F_by = 0.0
@@ -275,7 +310,8 @@ class BatchedPhysics:
     kernel, and writes results back to agent objects."""
 
     def __init__(self, width: float, height: float,
-                 obstacles: List[dict], tau: float = 0.5):
+                 obstacles: List[dict], tau: float = 0.5,
+                 wall_grid: np.ndarray = None):
         self.width = width
         self.height = height
 
@@ -287,6 +323,18 @@ class BatchedPhysics:
             self.obs_x = np.zeros(0, dtype=np.float64)
             self.obs_y = np.zeros(0, dtype=np.float64)
             self.obs_r = np.zeros(0, dtype=np.float64)
+
+        # Wall grid support (for floor plan walls)
+        if wall_grid is not None:
+            self.wall_grid = wall_grid.astype(np.int32)
+            self.wg_rows = wall_grid.shape[0]
+            self.wg_cols = wall_grid.shape[1]
+        else:
+            self.wall_grid = np.zeros(0, dtype=np.int32)
+            self.wg_rows = 0
+            self.wg_cols = 0
+        self.wall_resolution = max(width, height) / max(self.wg_rows, self.wg_cols) \
+            if self.wg_rows > 0 else 1.0
 
         self.tau = tau
         self.cell_size = 5.0
@@ -374,6 +422,8 @@ class BatchedPhysics:
             stamina_arr, fear_arr,
             coop_arr, family_ids,
             self.obs_x, self.obs_y, self.obs_r,
+            self.wall_grid.ravel() if self.wg_rows > 0 else np.zeros(0, dtype=np.int32),
+            self.wg_rows, self.wg_cols, self.wall_resolution,
             self.width, self.height,
             self.tau, dt,
             self.cell_size,

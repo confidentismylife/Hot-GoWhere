@@ -183,6 +183,9 @@ class RLZoneScheduler:
         self._irl_weights: Dict[str, np.ndarray] = {}
         self._use_irl_reward = False
 
+        # Pretrained flag: only use MLP if pretrained weights loaded
+        self._pretrained_loaded = False
+
     def initialize(self, pretrained_path: str = None):
         """Initialize policy networks.
 
@@ -361,9 +364,13 @@ class RLZoneScheduler:
         )
 
     def _forward(self, zone_id: int, obs: ZoneObservation) -> ZoneAction:
-        """MLP forward pass: observation → exit preferences [-1, 1]."""
+        """MLP forward pass: observation → exit preferences [-1, 1].
+
+        If no pretrained weights loaded, uses heuristic (random MLP would give
+        garbage recommendations that mislead the LLM).
+        """
         params = self._policies.get(zone_id)
-        if params is None:
+        if params is None or not self._pretrained_loaded:
             return self._heuristic_action(obs)
 
         x = obs.to_vector().reshape(1, -1)
@@ -428,11 +435,20 @@ class RLZoneScheduler:
     # ---- Persistence ----
 
     def save_weights(self, path: str):
-        """Save policy network weights."""
+        """Save policy network weights (NaN-safe)."""
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
         data = {}
+        nan_count = 0
         for zid, params in self._policies.items():
-            data[str(zid)] = {k: v.tolist() for k, v in params.items()}
+            zone_data = {}
+            for k, v in params.items():
+                arr = np.nan_to_num(v, nan=0.0, posinf=1.0, neginf=-1.0)
+                nan_count += int(np.sum(np.isnan(v)))
+                zone_data[k] = arr.tolist()
+            data[str(zid)] = zone_data
+        if nan_count > 0:
+            print(f"[RLScheduler] WARNING: {nan_count} NaN values replaced with 0.0 "
+                  f"during save — training may have diverged")
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False)
         print(f"[RLScheduler] Policy weights saved to {path}")
@@ -446,14 +462,11 @@ class RLZoneScheduler:
             loaded = {}
             # Backward compat: old format had "W3"/"b3" (single head)
             if "W3" in params_dict and "W3_a" not in params_dict:
-                # Old format: rename W3→W3_a, b3→b3_a, and add missing value head
                 loaded["W3_a"] = np.array(params_dict["W3"], dtype=np.float32)
                 loaded["b3_a"] = np.array(params_dict["b3"], dtype=np.float32)
-                # Initialize missing items
                 rng = np.random.RandomState(42)
                 loaded["W3_v"] = rng.randn(self.hidden_dim, 1).astype(np.float32) * 0.01
                 loaded["b3_v"] = np.zeros(1, dtype=np.float32)
-                # Copy shared layers if present
                 for key in ["W1", "b1", "W2", "b2"]:
                     if key in params_dict:
                         loaded[key] = np.array(params_dict[key], dtype=np.float32)
@@ -461,13 +474,14 @@ class RLZoneScheduler:
                 loaded = {k: np.array(v, dtype=np.float32) for k, v in params_dict.items()}
             self._policies[zid] = loaded
             self._prev_exit_usage[zid] = [0.0] * self.num_exits
+        self._pretrained_loaded = True
 
     # ---- Training interface (offline, MAPPO-style) ----
 
     def train_offline(self, env_simulator, episodes: int = 500,
                       steps_per_episode: int = 360,
-                      lr: float = 3e-4, save_path: str = None,
-                      log_interval: int = 50) -> dict:
+                      lr: float = 1e-4, save_path: str = None,
+                      log_interval: int = 5) -> dict:
         """Complete offline training loop using rule-based fast simulator.
 
         Runs many episodes without LLM — uses heuristic agents for fast rollout.
@@ -501,11 +515,32 @@ class RLZoneScheduler:
             total_reward = 0.0
 
             for step in range(steps_per_episode):
-                # Get environment snapshot and agents
-                env_snap, agents = env_simulator.step(env_simulator.dt)
+                # Build pre-step snapshot from current simulator state
+                pre_snap = _FastEnvSnapshot(
+                    grid=env_simulator.grid,
+                    grid_resolution=env_simulator.grid_res,
+                    exits=env_simulator.exit_positions,
+                    timestamp=env_simulator.tick * env_simulator.dt,
+                    disaster_type="fire",
+                    official_broadcast="",
+                )
+                pre_agents = _FastAgentList(
+                    positions=env_simulator.agent_positions,
+                    target_exits=env_simulator.agent_target_exits,
+                    exit_positions=env_simulator.exit_positions,
+                    alive=env_simulator.agent_alive,
+                    evacuated=env_simulator.agent_evacuated,
+                    fear=env_simulator.agent_fear,
+                    stamina=env_simulator.agent_stamina,
+                    age=env_simulator.agent_age,
+                    trained=env_simulator.agent_trained,
+                )
 
                 # RL inference for all zones
-                zone_actions = self.infer(env_snap, agents, step)
+                zone_actions = self.infer(pre_snap, pre_agents, step)
+
+                # Step simulator WITH zone actions so RL affects agent behavior
+                env_snap, agents = env_simulator.step(env_simulator.dt, zone_actions)
 
                 # Compute rewards from IRL weights and agent outcomes
                 for zone in self.zones:
@@ -769,6 +804,14 @@ class RLZoneScheduler:
             dW1 += x.T @ dL_dh1_pre                        # (obs_dim, hidden)
             db1 += dL_dh1_pre.sum(axis=0)                  # (hidden,)
 
+        # ---- Gradient clipping (prevent NaN from exploding gradients) ----
+        all_grads = [dW1, db1, dW2, db2, dW3_a, db3_a, dW3_v, db3_v]
+        total_norm = float(np.sqrt(sum(np.sum(g * g) for g in all_grads)))
+        max_norm = 10.0
+        scale = min(1.0, max_norm / (total_norm + 1e-8))
+        dW1 *= scale; db1 *= scale; dW2 *= scale; db2 *= scale
+        dW3_a *= scale; db3_a *= scale; dW3_v *= scale; db3_v *= scale
+
         # ---- Apply gradients (SGD) ----
         params["W1"] -= lr * dW1
         params["b1"] -= lr * db1
@@ -923,7 +966,7 @@ class FastTrainingSimulator:
         self.num_agents = num_agents
         self.num_exits = num_exits
         self.zones = zone_defs or DEFAULT_ZONES
-        self.dt = 0.1
+        self.dt = 1.0   # Coarse step for fast RL training (10× fewer steps)
         self.tick = 0
 
         rng = np.random.RandomState(seed)
@@ -950,8 +993,16 @@ class FastTrainingSimulator:
         self.grid_h = int(height / self.grid_res) + 1
         self.grid = np.zeros((self.grid_h, self.grid_w, 5), dtype=np.float32)
 
-        # Fire origin
-        self.fire_origin = (120.0, 65.0)
+        # Fire origins — place near 2 exits to create genuine pressure
+        if len(self.exit_positions) >= 4:
+            ex0 = np.array(self.exit_positions[0])
+            ex3 = np.array(self.exit_positions[3])
+            self.fire_origins = [
+                (ex0[0] + 15.0, ex0[1] + 15.0),
+                (ex3[0] - 15.0, ex3[1] - 15.0),
+            ]
+        else:
+            self.fire_origins = [(width / 2, height / 2)]
         self._init_fire(rng)
 
         # Agent states (simple Position-Velocity agents)
@@ -976,15 +1027,16 @@ class FastTrainingSimulator:
         self._initial_positions = self.agent_positions.copy()
 
     def _init_fire(self, rng):
-        fx = int(self.fire_origin[0] / self.grid_res)
-        fy = int(self.fire_origin[1] / self.grid_res)
-        for dy in range(-3, 4):
-            for dx in range(-3, 4):
-                py, px = fy + dy, fx + dx
-                if 0 <= py < self.grid_h and 0 <= px < self.grid_w:
-                    if dx*dx + dy*dy <= 9:
-                        self.grid[py, px, 3] = 0.8 + rng.random() * 0.2
-                        self.grid[py, px, 0] = 0.3 + rng.random() * 0.2
+        for ox, oy in self.fire_origins:
+            fx = int(ox / self.grid_res)
+            fy = int(oy / self.grid_res)
+            for dy in range(-6, 7):
+                for dx in range(-6, 7):
+                    py, px = fy + dy, fx + dx
+                    if 0 <= py < self.grid_h and 0 <= px < self.grid_w:
+                        if dx*dx + dy*dy <= 36:
+                            self.grid[py, px, 3] = 0.8 + rng.random() * 0.2
+                            self.grid[py, px, 0] = 0.3 + rng.random() * 0.2
 
     def reset(self):
         self.tick = 0
@@ -994,26 +1046,37 @@ class FastTrainingSimulator:
         self.agent_evacuated.fill(False)
         self._init_fire(np.random.RandomState(42))
 
-    def step(self, dt: float):
-        """Run one tick: spread fire/smoke, move agents heuristically."""
+    def step(self, dt: float, zone_actions: dict = None):
+        """Run one tick: spread fire/smoke, move agents.
+
+        If zone_actions is provided (from RL scheduler), agents blend the zone's
+        exit preferences with their own heuristic, creating the feedback loop
+        that allows RL to influence evacuation outcomes.
+        """
         self.tick += 1
 
-        # Spread fire and smoke
-        if self.tick % 10 == 0:
-            new_fire = self.grid[:, :, 3].copy()
-            for y in range(1, self.grid_h - 1):
-                for x in range(1, self.grid_w - 1):
-                    if self.grid[y, x, 3] > 0.5:
-                        for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                            if np.random.random() < 0.15:
-                                ny, nx = y + dy, x + dx
-                                new_fire[ny, nx] = max(new_fire[ny, nx],
-                                                       self.grid[y, x, 3] * 0.85)
-            self.grid[:, :, 3] = new_fire
-            self.grid[:, :, 0] = np.maximum(
-                self.grid[:, :, 0] * 0.95,
-                self.grid[:, :, 3] * 0.6,
-            )
+        # Spread fire and smoke every tick (dt=1.0, so every 1.0 simulated second)
+        fire = self.grid[:, :, 3]
+        sources = np.where(fire > 0.5, fire * 0.85, 0.0).astype(np.float32)
+
+        # Spread from 4 directions into target cell
+        up = np.zeros_like(fire)
+        up[:-1, :] = sources[1:, :]
+        down = np.zeros_like(fire)
+        down[1:, :] = sources[:-1, :]
+        left = np.zeros_like(fire)
+        left[:, :-1] = sources[:, 1:]
+        right = np.zeros_like(fire)
+        right[:, 1:] = sources[:, :-1]
+
+        rand_mask = np.random.random(fire.shape).astype(np.float32) < 0.40
+        incoming = np.where(rand_mask, np.maximum.reduce([up, down, left, right]), 0.0)
+
+        self.grid[:, :, 3] = np.maximum(fire, incoming)
+        self.grid[:, :, 0] = np.maximum(
+            self.grid[:, :, 0] * 0.85,
+            self.grid[:, :, 3] * 0.6,
+        )
 
         # Move agents toward their chosen exits
         for i in range(self.num_agents):
@@ -1030,28 +1093,28 @@ class FastTrainingSimulator:
                 continue
 
             # Speed depends on stamina and age
-            base_speed = 1.2
+            base_speed = 1.0
             if self.agent_stamina[i] < 30:
-                base_speed = 0.6
+                base_speed = 0.5
             elif self.agent_age[i] > 55:
-                base_speed = 0.8
+                base_speed = 0.7
 
             velocity = direction / dist * base_speed
             self.agent_velocities[i] = velocity
             self.agent_positions[i] += velocity * dt
 
-            # Stamina drain
-            self.agent_stamina[i] -= 0.02 * base_speed
+            # Stamina drain (scaled for dt=1.0)
+            self.agent_stamina[i] -= 0.2 * base_speed
 
-            # Check fire proximity
+            # Check fire proximity + lethal smoke
             gx = int(self.agent_positions[i, 0] / self.grid_res)
             gy = int(self.agent_positions[i, 1] / self.grid_res)
             if 0 <= gx < self.grid_w and 0 <= gy < self.grid_h:
-                if self.grid[gy, gx, 3] > 0.5:
+                if self.grid[gy, gx, 3] > 0.5 or self.grid[gy, gx, 0] > 0.7:
                     self.agent_alive[i] = False
 
-            # Heuristic: re-evaluate exit choice every 30 ticks
-            if self.tick % 30 == 0:
+            # Re-evaluate exit choice every 3 ticks
+            if self.tick % 3 == 0:
                 best_exit = self.agent_target_exits[i]
                 best_score = float("inf")
                 for e in range(self.num_exits):
@@ -1063,7 +1126,20 @@ class FastTrainingSimulator:
                     smoke = 0.0
                     if 0 <= ex < self.grid_w and 0 <= ey < self.grid_h:
                         smoke = float(self.grid[ey, ex, 0])
-                    score = d + smoke * 200
+                    heuristic_score = d + smoke * 200
+
+                    # Blend with zone recommendation if available
+                    zone_pref = 0.0
+                    if zone_actions is not None:
+                        for zone in self.zones:
+                            if (zone.x_min <= self.agent_positions[i, 0] < zone.x_max and
+                                zone.y_min <= self.agent_positions[i, 1] < zone.y_max):
+                                act = zone_actions.get(zone.zone_id)
+                                if act is not None:
+                                    zone_pref = act.exit_preferences[e]
+                                break
+                    # Blend: 50% heuristic + 50% zone preference
+                    score = heuristic_score * 0.5 - zone_pref * 60.0
                     if score < best_score:
                         best_score = score
                         best_exit = e

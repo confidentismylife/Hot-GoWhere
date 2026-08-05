@@ -23,6 +23,7 @@ Extension: GC-MaxEnt (Group-Constrained MaxEnt IRL)
 
 import json
 import os
+import sys
 import numpy as np
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, field
@@ -760,7 +761,8 @@ class IRLRecovery:
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="IRL Recovery from LLM trajectories")
+    parser = argparse.ArgumentParser(
+        description="IRL Recovery from LLM/Oracle trajectories")
     parser.add_argument("--trajectory_dir", type=str, required=True,
                        help="Directory containing .jsonl trajectory files")
     parser.add_argument("--output", type=str, default="data/irl_weights.json",
@@ -769,13 +771,113 @@ if __name__ == "__main__":
                        help="Learning rate")
     parser.add_argument("--max_iter", type=int, default=500,
                        help="Max IRL iterations")
+    parser.add_argument("--weight_config", type=str, default=None,
+                       help="Only load trajectories matching this Oracle weight "
+                            "config name (e.g. safety_first, balanced, "
+                            "efficiency_first). Used for sensitivity analysis. "
+                            "If not set, loads all trajectories.")
+    parser.add_argument("--compare", action="store_true",
+                       help="Run IRL separately for each weight_config found in "
+                            "trajectory files and print a comparison table.")
     args = parser.parse_args()
 
     collector = TrajectoryCollector()
-    trajectories = collector.load_all(args.trajectory_dir)
-    print(f"Loaded {len(trajectories)} trajectories from {args.trajectory_dir}")
 
-    irl = IRLRecovery(learning_rate=args.lr, max_iter=args.max_iter)
-    irl.fit(trajectories, verbose=True)
-    irl.save(args.output)
-    print("Done.")
+    if args.compare:
+        # Sensitivity analysis mode: fit IRL per weight config and compare
+        import glob as _glob
+        all_files = _glob.glob(os.path.join(args.trajectory_dir, "oracle_*.jsonl"))
+        # Group files by weight_config prefix in filename.
+        # Format: oracle_{config}_run_NNN.jsonl
+        # config may contain underscores (e.g. "safety_first").
+        config_groups: Dict[str, List[str]] = defaultdict(list)
+        for f in all_files:
+            basename = os.path.basename(f)
+            # Strip .jsonl and "oracle_" prefix
+            stem = basename.replace(".jsonl", "")
+            if not stem.startswith("oracle_"):
+                continue
+            inner = stem[len("oracle_"):]  # e.g. "safety_first_run_001"
+            # Split at "_run_" to get the config name
+            idx = inner.find("_run_")
+            if idx < 0:
+                continue
+            cfg_name = inner[:idx]  # "safety_first"
+            config_groups[cfg_name].append(f)
+
+        if not config_groups:
+            print(f"No oracle_*_*.jsonl files found in {args.trajectory_dir}")
+            print("Run generate_oracle_trajectories.py --weights all first.")
+            sys.exit(1)
+
+        print(f"Found {len(config_groups)} Oracle weight configs: "
+              f"{list(config_groups.keys())}")
+        print()
+
+        results = {}
+        for cfg_name, files in config_groups.items():
+            trajectories = []
+            for f in files:
+                trajectories.extend(collector.load(f))
+            print(f"[{cfg_name}] {len(trajectories)} trajectories from "
+                  f"{len(files)} files")
+
+            irl = IRLRecovery(learning_rate=args.lr, max_iter=args.max_iter)
+            irl.fit(trajectories, verbose=False)
+            results[cfg_name] = irl
+
+            output_path = (args.output.replace(".json", f"_{cfg_name}.json")
+                           if args.output == "data/irl_weights.json"
+                           else args.output)
+            irl.save(output_path)
+
+        # Print comparison table
+        print("\n" + "=" * 75)
+        print("  SENSITIVITY ANALYSIS: Recovered Weights by Oracle Config")
+        print("=" * 75)
+        header = (f"{'Config':<22} {'safety':>8} {'efficiency':>11} "
+                  f"{'social':>8} {'conformity':>10} {'comfort':>9}")
+        print(header)
+        print("-" * 75)
+        for cfg_name in sorted(results.keys()):
+            irl = results[cfg_name]
+            for persona in sorted(irl.weights.keys()):
+                w = irl.weights[persona]
+                print(f"{cfg_name+'/'+persona:<22} "
+                      f"{w[0]:8.3f} {w[1]:11.3f} {w[2]:8.3f} "
+                      f"{w[3]:10.3f} {w[4]:9.3f}")
+        print("-" * 75)
+        print("Expected: IRL should recover safety >> efficiency for 'safety_first',")
+        print("         efficiency >> safety for 'efficiency_first', and near-equal")
+        print("         weights for 'balanced'. If so, the IRL algorithm is validated.")
+        print("=" * 75)
+
+    elif args.weight_config:
+        # Single config mode: filter files by weight_config name
+        import glob as _glob
+        pattern = f"oracle_{args.weight_config}_*.jsonl"
+        files = _glob.glob(os.path.join(args.trajectory_dir, pattern))
+        if not files:
+            print(f"No files matching '{pattern}' in {args.trajectory_dir}")
+            sys.exit(1)
+        trajectories = []
+        for f in files:
+            trajectories.extend(collector.load(f))
+        print(f"Loaded {len(trajectories)} trajectories "
+              f"(weight_config={args.weight_config}, {len(files)} files)")
+
+        irl = IRLRecovery(learning_rate=args.lr, max_iter=args.max_iter)
+        irl.fit(trajectories, verbose=True)
+        irl.save(args.output)
+        print("Done.")
+
+    else:
+        # Default: load all files (backward compatible)
+        trajectories = collector.load_all(args.trajectory_dir)
+        print(f"Loaded {len(trajectories)} trajectories from "
+              f"{args.trajectory_dir}")
+
+        irl = IRLRecovery(learning_rate=args.lr, max_iter=args.max_iter)
+        irl.fit(trajectories, verbose=True)
+        irl.save(args.output)
+        print("Done.")

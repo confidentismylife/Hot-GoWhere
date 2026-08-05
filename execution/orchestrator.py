@@ -822,6 +822,14 @@ class SimulationOrchestrator:
             self.tick += 1
             self.sim_time += self.dt
 
+        # ---- Drain pending LLM results before shutdown ----
+        if self.use_llm:
+            final_decisions = self.llm_engine.drain(timeout=30.0)
+            if final_decisions:
+                self.decision_count += len(final_decisions)
+                self.total_llm_time += sum(d.compute_time for d in final_decisions.values())
+                print(f"[Orchestrator] Drained {len(final_decisions)} final LLM results")
+
         # ---- Cleanup ----
         if vis:
             vis.close()
@@ -1208,7 +1216,7 @@ class SimulationOrchestrator:
         history = scheduler.train_offline(
             env_simulator=sim,
             episodes=episodes,
-            steps_per_episode=int(self.duration / self.dt),
+            steps_per_episode=int(self.duration / sim.dt),
             save_path=output_path,
         )
 
@@ -1244,4 +1252,11 @@ class SimulationOrchestrator:
                    if self.decision_count > 0 else 0)
         print(f"  Avg LLM latency:  {avg_llm:.0f}ms/decision")
         print(f"  Total LLM time:   {self.total_llm_time:.1f}s")
+        if self.use_llm:
+            fb_rate = self.llm_engine.fallback_rate
+            fb_pct = fb_rate * 100
+            print(f"  LLM parse fails:  {self.llm_engine.parse_failures}/{self.llm_engine.total_llm_decisions} "
+                  f"({fb_pct:.1f}% fallback)")
+            if fb_pct > 20:
+                print(f"  !! WARNING: High LLM fallback rate — check max_tokens and prompt format")
         print("=" * 60)

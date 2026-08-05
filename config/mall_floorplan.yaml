@@ -1,7 +1,7 @@
-# 北京朝阳大悦城 1F — Real Shopping Mall Evacuation Scenario
+# 武汉保利广场 1F — Real Shopping Mall Evacuation Scenario
 #
-# 150m × 80m, central atrium, 4 corridors, 8 exits, 30+ shops
-# Layout: ring corridor around central atrium, shops on perimeter
+# 200m × 120m, 多翼结构, 中央中庭, 6 exits, 30+ shops
+# Layout: 多翼布局, 中央回廊中庭, 东餐厅区/西影院区
 #
 # Usage:
 #   python main.py --config config/mall_floorplan.yaml --gradio
@@ -16,29 +16,29 @@ simulation:
 
 environment:
   type: "mall"                  # NEW: mall floor plan mode
-  floorplan: "chaoyang_joycity_1f"  # Built-in floor plan name
-  width: 150.0                  # Overridden by floorplan, fallback for compatibility
-  height: 80.0                  # Overridden by floorplan, fallback for compatibility
+  floorplan: "wuhan_baoli_1f"   # 武汉保利广场
+  width: 200.0                  # Overridden by floorplan, fallback for compatibility
+  height: 120.0                 # Overridden by floorplan, fallback for compatibility
   disaster: "fire"
-  disaster_origin: [120.0, 65.0]   # Kitchen/restaurant area (southeast)
+  disaster_origin: [170.0, 100.0]  # 东南餐饮区 (太二酸菜鱼、麦当劳附近)
   disaster_spread_rate: 0.10       # Faster spread → LLM proactive advantage matters more
-  exit_positions:               # Override floorplan: 4 exits → congestion → LLM advantage
-    - [75.0, 2.0]     # 南 — 适中距离
-    - [2.0, 40.0]     # 西 — 安全，远离火源
-    - [148.0, 40.0]   # 东 — 近火源，风险出口
-    - [75.0, 78.0]    # 北 — 安全，远离火源
 
-  # Exits are defined by the floor plan, but can be overridden here
-  # exit_positions: [...]          # Leave empty to use floor plan defaults
-  # obstacles: [...]               # Leave empty to use floor plan defaults
+  # Use floor plan defaults (6 exits), comment to override
+  # exit_positions:
+  #   - [55.0, 2.0]     # 北1 — 主入口
+  #   - [145.0, 2.0]    # 北2 — 次入口
+  #   - [2.0, 45.0]     # 西1 — 消防楼梯
+  #   - [2.0, 85.0]     # 西2 — 影院出口
+  #   - [198.0, 60.0]   # 东1 — 餐厅出口
+  #   - [100.0, 118.0]  # 南 — 正门入口
 
 llm:
   model: "Qwen/Qwen2.5-7B-Instruct-AWQ"
   quantization: "awq"
   max_model_len: 4096
-  gpu_memory_utilization: 0.85      # 7B AWQ ~3.5GB + KV cache, leave margin for 32GB card
+  gpu_memory_utilization: 0.75      # 7B AWQ ~3.5GB + KV cache, safe for 24GB 4090
   temperature: 0.3
-  max_tokens: 128                    # Must be ≥128 for complete JSON with Chinese reasoning
+  max_tokens: 256                    # Chinese JSON with reasoning needs ~150-200 tokens
   batch_size: 32
   lora_path: ""
 
@@ -61,8 +61,8 @@ agents:
 
 visualization:
   enabled: true
-  width: 1400     # Wider for 150m layout
-  height: 750     # Aspect ratio ~2:1
+  width: 1400     # 200m × 7 px/m
+  height: 840     # 120m × 7 px/m, aspect ratio 5:3
 
 vlm:
   enabled: false
@@ -100,9 +100,9 @@ rl_scheduling:
   irl_weights: "data/irl_weights.json"   # Path to IRL-learned reward weights
   rl_inference_interval: 1                # Ticks between RL inference (1 = every tick)
 
-# Zone definitions for RL scheduler (4 quadrants of 150m×80m mall)
+# Zone definitions for RL scheduler (4 quadrants of 200m×120m mall)
 zones:
-  - {id: 0, name: "西北区", x_min: 0,   x_max: 75,  y_min: 40, y_max: 80, primary_exits: [1,3], description: "商场西北区域，靠近ZARA、H&M"}
-  - {id: 1, name: "东北区", x_min: 75,  x_max: 150, y_min: 40, y_max: 80, primary_exits: [2,3], description: "商场东北区域，靠近优衣库、海底捞"}
-  - {id: 2, name: "西南区", x_min: 0,   x_max: 75,  y_min: 0,  y_max: 40, primary_exits: [0,1], description: "商场西南区域，靠近星巴克、Apple"}
-  - {id: 3, name: "东南区", x_min: 75,  x_max: 150, y_min: 0,  y_max: 40, primary_exits: [0,2], description: "商场东南区域，靠近华为、餐饮区"}
+  - {id: 0, name: "西北区", x_min: 0,   x_max: 100, y_min: 60, y_max: 120, primary_exits: [0,2,3], description: "商场西北区域，靠近万达影城、海底捞、星巴克"}
+  - {id: 1, name: "东北区", x_min: 100, x_max: 200, y_min: 60, y_max: 120, primary_exits: [1,4], description: "商场东北区域，靠近迪卡侬、MUJI"}
+  - {id: 2, name: "西南区", x_min: 0,   x_max: 100, y_min: 0,  y_max: 60,  primary_exits: [2,3,5], description: "商场西南区域，靠近Apple、华为、泡泡玛特"}
+  - {id: 3, name: "东南区", x_min: 100, x_max: 200, y_min: 0,  y_max: 60,  primary_exits: [4,5], description: "商场东南区域，靠近餐饮区、太二酸菜鱼、麦当劳（火源区域）"}

@@ -76,6 +76,10 @@ class LLMCognitiveEngine:
         self._inference_lock = threading.Lock()
         self._result_queue = queue.Queue()
 
+        # v2.3: 回退统计 (parse failure tracking)
+        self._total_llm_decisions: int = 0
+        self._parse_failures: int = 0
+
     def initialize(self):
         """Load model and warm up. Call once before simulation starts."""
         print(f"[CogEngine] Loading {self.model_name} ...")
@@ -105,7 +109,6 @@ class LLMCognitiveEngine:
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             top_p=0.9,
-            stop=["\n\n"],  # Stop at double newline in case JSON is broken
         )
 
         elapsed = time.time() - t0
@@ -181,6 +184,8 @@ class LLMCognitiveEngine:
             return
 
         # Start the drain chain
+        print(f"[CogEngine] submit_batch: {len(agents)} agents → "
+              f"pending queue ({len(self._pending_agents)} total)")
         self._process_next_batch()
 
     def _process_next_batch(self):
@@ -220,6 +225,9 @@ class LLMCognitiveEngine:
             self._inference_thread = None
             return
 
+        print(f"[CogEngine] Preparing batch: {len(all_agents)} agents, "
+              f"{len(pending)} pending slots consumed")
+
         formatted_prompts = self.tokenizer.apply_chat_template(
             all_formatted, tokenize=False, add_generation_prompt=True)
 
@@ -229,6 +237,8 @@ class LLMCognitiveEngine:
                 result = self._fallback_decision(agent, env_snap)
                 with self._inference_lock:
                     self._results[agent.id] = result
+                    self._total_llm_decisions += 1
+                    self._parse_failures += 1
             # Continue chain in case more agents arrived
             self._process_next_batch()
             return
@@ -244,14 +254,19 @@ class LLMCognitiveEngine:
         """Background: run vLLM inference, store results, chain to next batch."""
         try:
             t0 = time.time()
+            print(f"[CogEngine] GPU inference START: {len(agents)} agents, "
+                  f"{len(formatted_prompts)} prompts")
             outputs = self.llm.generate(formatted_prompts, self.sampling_params)
             compute_time = time.time() - t0
+            print(f"[CogEngine] GPU inference DONE: {len(outputs)} outputs "
+                  f"in {compute_time:.1f}s")
 
             for agent, output in zip(agents, outputs):
                 raw = output.outputs[0].text
                 result = self._parse_decision(agent, raw, env, compute_time)
                 with self._inference_lock:
                     self._results[agent.id] = result
+                    self._total_llm_decisions += 1
 
         except Exception as e:
             print(f"[CogEngine] Inference error: {e}")
@@ -259,6 +274,8 @@ class LLMCognitiveEngine:
                 result = self._fallback_decision(agent, env)
                 with self._inference_lock:
                     self._results[agent.id] = result
+                    self._total_llm_decisions += 1
+                    self._parse_failures += 1
 
         # Chain: drain any agents that arrived while GPU was busy
         # Only chain if still ready — shutdown() may have been called
@@ -271,6 +288,43 @@ class LLMCognitiveEngine:
             results = dict(self._results)
             self._results.clear()
         return results
+
+    def drain(self, timeout: float = 60.0) -> Dict[str, DecisionResult]:
+        """Block until all pending inference completes, return all results.
+
+        Call BEFORE shutdown() at simulation end to ensure no results are lost.
+        """
+        # Wait for active inference thread
+        if self._inference_thread and self._inference_thread.is_alive():
+            print(f"[CogEngine] Waiting for inference to finish (timeout={timeout}s)...")
+            self._inference_thread.join(timeout=timeout)
+        # Process any remaining pending agents (chain should handle this,
+        # but collect stragglers synchronously as a safety net)
+        with self._inference_lock:
+            remaining = len(self._pending_agents)
+        if remaining > 0:
+            print(f"[CogEngine] Drain: processing {remaining} leftover pending agents")
+            # Force one more chain iteration
+            self._process_next_batch()
+            if self._inference_thread and self._inference_thread.is_alive():
+                self._inference_thread.join(timeout=timeout)
+        return self.collect_results()
+
+    @property
+    def fallback_rate(self) -> float:
+        """Parse failure rate (0.0–1.0). Returns 0 if no decisions processed."""
+        total = self._total_llm_decisions
+        if total == 0:
+            return 0.0
+        return self._parse_failures / total
+
+    @property
+    def total_llm_decisions(self) -> int:
+        return self._total_llm_decisions
+
+    @property
+    def parse_failures(self) -> int:
+        return self._parse_failures
 
     def block_until_ready(self, timeout: float = 5.0):
         """Block until model is loaded."""
@@ -289,6 +343,7 @@ class LLMCognitiveEngine:
         try:
             data = PromptManager.parse_response(raw_text)
         except json.JSONDecodeError:
+            self._parse_failures += 1
             return self._fallback_decision(agent, env)
 
         # Parse target exit (common to civilian + guide)

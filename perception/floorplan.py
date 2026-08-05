@@ -419,8 +419,237 @@ def load_floorplan_from_image(image_path: str, resolution: float = 0.5,
 # Built-in floor plans registry
 # ================================================================
 
+def build_wuhan_baoli_1f() -> FloorPlan:
+    """武汉保利广场 1F — 真实商场平面图.
+
+    约 200m × 120m，多翼结构，中央中庭 + 南北走廊 + 东西两翼.
+    6 个出口，分布在商场各方位.
+    """
+    resolution = 0.5
+    width = 200.0
+    height = 120.0
+    cols = int(width / resolution)    # 400
+    rows = int(height / resolution)   # 240
+
+    grid = np.zeros((rows, cols), dtype=np.uint8)
+    wall_thick = 4
+
+    # === 外墙 ===
+    grid[:wall_thick, :] = 1
+    grid[-wall_thick:, :] = 1
+    grid[:, :wall_thick] = 1
+    grid[:, -wall_thick:] = 1
+
+    # === 中央中庭 (50×30m, 略偏北) ===
+    atrium_cx = cols // 2          # 200
+    atrium_cy = rows // 2 + 20     # 140 (偏北)
+    atrium_w = int(50 / resolution)  # 100
+    atrium_h = int(30 / resolution)  # 60
+
+    # 中庭周围墙体 (回廊)
+    a_left = atrium_cx - atrium_w // 2
+    a_right = atrium_cx + atrium_w // 2
+    a_top = atrium_cy - atrium_h // 2
+    a_bottom = atrium_cy + atrium_h // 2
+
+    # 中庭内部开放 (不做墙)
+    # 中庭中央有扶梯
+    esc_w = int(3 / resolution)
+    esc_h = int(8 / resolution)
+    for esc_x in [atrium_cx - int(8/resolution), atrium_cx + int(8/resolution)]:
+        r1 = atrium_cy - esc_h // 2
+        r2 = atrium_cy + esc_h // 2
+        c1 = esc_x - esc_w // 2
+        c2 = esc_x + esc_w // 2
+        grid[r1:r2, c1:c2] = 1
+
+    # === 北翼走廊 (中庭向北到北墙) ===
+    # 两条平行走廊中间是店铺
+    n_corridor_w = int(6 / resolution)   # 走廊宽6m
+    # 北走廊从北墙到中庭
+
+    # === 南翼走廊 (中庭向南) ===
+    s_corridor_w = int(6 / resolution)
+
+    # === 东翼 (餐厅区, 延伸出去) ===
+    e_wing_start = a_right + int(8 / resolution)
+    e_wing_end = cols - wall_thick
+    # 东翼走廊
+    e_corridor_top = atrium_cy - int(8 / resolution)
+    e_corridor_bottom = atrium_cy + int(8 / resolution)
+
+    # === 西翼 (影院区, 延伸出去) ===
+    w_wing_start = wall_thick
+    w_wing_end = a_left - int(8 / resolution)
+    w_corridor_top = atrium_cy - int(8 / resolution)
+    w_corridor_bottom = atrium_cy + int(8 / resolution)
+
+    # === 店铺分隔墙 ===
+    # 北区店铺 (中庭上方, 4排店铺)
+    n_shop_zone = a_top - wall_thick
+    n_divs = [
+        int(cols * 0.15), int(cols * 0.30), int(cols * 0.45),
+        int(cols * 0.60), int(cols * 0.75), int(cols * 0.90)
+    ]
+    for div_x in n_divs:
+        grid[wall_thick + int(20/resolution):n_shop_zone, div_x:div_x+2] = 1
+
+    # 南区店铺 (中庭下方)
+    s_shop_zone = a_bottom
+    s_divs = [
+        int(cols * 0.12), int(cols * 0.28), int(cols * 0.44),
+        int(cols * 0.58), int(cols * 0.72), int(cols * 0.88)
+    ]
+    for div_x in s_divs:
+        grid[s_shop_zone:rows-wall_thick-int(20/resolution), div_x:div_x+2] = 1
+
+    # 东翼店铺分隔
+    e_divs = [
+        int(a_top + int(5/resolution)),
+        int(atrium_cy - int(14/resolution)),
+        int(atrium_cy + int(14/resolution)),
+        int(a_bottom - int(5/resolution)),
+    ]
+    for div_y in e_divs:
+        grid[div_y:div_y+2, e_wing_start:cols-wall_thick] = 1
+
+    # 西翼店铺分隔
+    w_divs = [
+        int(a_top + int(5/resolution)),
+        int(atrium_cy - int(14/resolution)),
+        int(atrium_cy + int(14/resolution)),
+        int(a_bottom - int(5/resolution)),
+    ]
+    for div_y in w_divs:
+        grid[div_y:div_y+2, wall_thick:w_wing_end] = 1
+
+    # === 走廊墙体 (形成回廊) ===
+    # 中庭北边界
+    grid[a_top:a_top+1, a_left:a_right+1] = 1
+    for div_x in [int(cols*0.25), int(cols*0.40), int(cols*0.55), int(cols*0.70)]:
+        hole_s = div_x + 2
+        hole_e = hole_s + int(10/resolution)
+        grid[a_top:a_top+1, hole_s:hole_e] = 0
+
+    # 中庭南边界
+    grid[a_bottom-1:a_bottom, a_left:a_right+1] = 1
+    for div_x in [int(cols*0.22), int(cols*0.38), int(cols*0.54), int(cols*0.72)]:
+        hole_s = div_x + 2
+        hole_e = hole_s + int(10/resolution)
+        grid[a_bottom-1:a_bottom, hole_s:hole_e] = 0
+
+    # 中庭西边界
+    grid[a_top:a_bottom, a_left:a_left+1] = 1
+    for div_y in [int(atrium_cy - int(18/resolution)), atrium_cy, int(atrium_cy + int(18/resolution))]:
+        hole_s = div_y + 2
+        hole_e = hole_s + int(8/resolution)
+        grid[hole_s:hole_e, a_left:a_left+1] = 0
+
+    # 中庭东边界
+    grid[a_top:a_bottom, a_right-1:a_right] = 1
+    for div_y in [int(atrium_cy - int(18/resolution)), atrium_cy, int(atrium_cy + int(18/resolution))]:
+        hole_s = div_y + 2
+        hole_e = hole_s + int(8/resolution)
+        grid[hole_s:hole_e, a_right-1:a_right] = 0
+
+    # === 柱子 (回廊中每隔12m) ===
+    pillar_r = int(0.8 / resolution)
+    # 北回廊
+    for px in range(a_left + int(8/resolution), a_right, int(12/resolution)):
+        py = a_top - int(6/resolution)
+        for dr in range(-pillar_r, pillar_r+1):
+            for dc in range(-pillar_r, pillar_r+1):
+                if dr*dr + dc*dc <= pillar_r*pillar_r:
+                    grid[py+dr, px+dc] = 1
+    # 南回廊
+    for px in range(a_left + int(8/resolution), a_right, int(12/resolution)):
+        py = a_bottom + int(6/resolution)
+        for dr in range(-pillar_r, pillar_r+1):
+            for dc in range(-pillar_r, pillar_r+1):
+                if dr*dr + dc*dc <= pillar_r*pillar_r:
+                    grid[py+dr, px+dc] = 1
+
+    # === 出口 (6个) ===
+    exits = [
+        (55.0, 2.0),      # 北1 — 北侧主入口
+        (145.0, 2.0),     # 北2 — 北侧次入口
+        (2.0, 45.0),      # 西1 — 消防楼梯
+        (2.0, 85.0),      # 西2 — 影院出口
+        (198.0, 60.0),    # 东1 — 餐厅区出口
+        (100.0, 118.0),   # 南 — 南主入口 (正门)
+    ]
+    exit_names = [
+        "北1-主入口", "北2-次入口",
+        "西1-消防楼梯", "西2-影院出口",
+        "东1-餐厅出口", "南-正门入口",
+    ]
+    fire_stairs = [(55.0, 4.0), (4.0, 45.0), (198.0, 60.0)]
+
+    # 切出出口开口
+    for ex, ey in exits:
+        col = int(ex / resolution)
+        row = int(ey / resolution)
+        opening = int(3 / resolution)
+        if ey < 5:
+            grid[0:wall_thick, col-opening:col+opening] = 0
+        elif ey > height - 5:
+            grid[-wall_thick:, col-opening:col+opening] = 0
+        elif ex < 5:
+            grid[row-opening:row+opening, 0:wall_thick] = 0
+        elif ex > width - 5:
+            grid[row-opening:row+opening, -wall_thick:] = 0
+
+    # 障碍物
+    obstacles = [
+        {"center": [80.0, 50.0], "radius": 1.2, "label": "中庭柱"},
+        {"center": [120.0, 50.0], "radius": 1.2, "label": "中庭柱"},
+        {"center": [80.0, 75.0], "radius": 1.2, "label": "中庭柱"},
+        {"center": [120.0, 75.0], "radius": 1.2, "label": "中庭柱"},
+        {"center": [100.0, 60.0], "radius": 3.0, "label": "服务台"},
+        {"center": [130.0, 30.0], "radius": 1.5, "label": "电梯间"},
+        {"center": [70.0, 30.0], "radius": 1.5, "label": "电梯间"},
+    ]
+
+    # 火源 — 东南餐饮区
+    fire_origin = (170.0, 100.0)
+
+    # 店铺标注
+    rooms = [
+        {"x": 10, "y": 15, "w": 18, "h": 12, "label": "万达影城"},
+        {"x": 45, "y": 10, "w": 14, "h": 14, "label": "优衣库"},
+        {"x": 80, "y": 10, "w": 16, "h": 14, "label": "ZARA"},
+        {"x": 115, "y": 10, "w": 15, "h": 14, "label": "H&M"},
+        {"x": 145, "y": 10, "w": 14, "h": 14, "label": "MUJI"},
+        {"x": 170, "y": 15, "w": 14, "h": 12, "label": "迪卡侬"},
+        {"x": 5, "y": 55, "w": 12, "h": 10, "label": "星巴克"},
+        {"x": 5, "y": 70, "w": 12, "h": 12, "label": "海底捞"},
+        {"x": 170, "y": 55, "w": 14, "h": 12, "label": "西贝莜面"},
+        {"x": 175, "y": 75, "w": 12, "h": 12, "label": "太二酸菜鱼"},
+        {"x": 175, "y": 92, "w": 12, "h": 12, "label": "麦当劳"},
+        {"x": 55, "y": 100, "w": 14, "h": 12, "label": "Apple Store"},
+        {"x": 80, "y": 100, "w": 12, "h": 12, "label": "华为"},
+        {"x": 50, "y": 80, "w": 12, "h": 14, "label": "泡泡玛特"},
+    ]
+
+    grid = np.flipud(grid)
+
+    return FloorPlan(
+        name="武汉保利广场 1F",
+        width=width,
+        height=height,
+        grid=grid,
+        exits=exits,
+        exit_names=exit_names,
+        fire_stairs=fire_stairs,
+        obstacles=obstacles,
+        disaster_origin_default=fire_origin,
+        rooms=rooms,
+    )
+
+
 BUILTIN_FLOORPLANS = {
     "chaoyang_joycity_1f": build_chaoyang_joycity_1f,
+    "wuhan_baoli_1f": build_wuhan_baoli_1f,
 }
 
 

@@ -14,6 +14,9 @@ Usage:
 import argparse
 import sys
 import os
+import random
+
+import numpy as np
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -34,6 +37,10 @@ def main():
         help="Disable visualization (pure headless mode)"
     )
     parser.add_argument(
+        "--no-llm", action="store_true",
+        help="Disable LLM entirely (heuristic-only simulation, no vLLM needed)"
+    )
+    parser.add_argument(
         "--record", action="store_true",
         help="Save frames to disk as PNGs (headless, for video/gif later)"
     )
@@ -48,6 +55,10 @@ def main():
     parser.add_argument(
         "--duration", "-d", type=float, default=None,
         help="Override simulation duration in seconds"
+    )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Override simulation random seed"
     )
     parser.add_argument(
         "--model", "-m", type=str, default=None,
@@ -144,12 +155,20 @@ def main():
         orchestrator.duration = args.duration
         orchestrator.cfg["simulation"]["duration"] = args.duration
 
+    if args.seed is not None:
+        orchestrator.cfg["simulation"]["seed"] = args.seed
+        orchestrator.seed = args.seed
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+
     if args.model:
         orchestrator.cfg["llm"]["model"] = args.model
         orchestrator.llm_engine.model_name = args.model
 
     if args.no_viz:
         orchestrator.cfg["visualization"]["enabled"] = False
+    if args.no_llm:
+        orchestrator.cfg.setdefault("llm", {})["enabled"] = False
     if args.record:
         orchestrator.cfg["visualization"]["mode"] = "headless"
         orchestrator.cfg["visualization"]["frame_interval"] = args.frame_interval

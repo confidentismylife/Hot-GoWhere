@@ -29,6 +29,7 @@ environment:
     - {center: [75.0, 40.0], radius: 1.5}    # Pillar
 
 llm:
+  enabled: true                 # Set false (or use --no-llm) for heuristic-only runs
   model: "Qwen/Qwen2.5-3B-Instruct-AWQ"  # 2GB VRAM with AWQ
   quantization: "awq"           # awq | gptq | none
   max_model_len: 4096

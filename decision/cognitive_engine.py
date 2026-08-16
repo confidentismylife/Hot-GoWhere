@@ -33,6 +33,8 @@ class DecisionResult:
     risk_assessment: str
     compute_time: float
     raw_data: dict = None  # Full parsed LLM JSON (for command roles)
+    tick: int = 0          # Simulation tick at which the decision was made
+    source: str = "unknown"  # llm | llm_fallback | heuristic | oracle | safety_fallback
 
 
 class LLMCognitiveEngine:
@@ -58,6 +60,7 @@ class LLMCognitiveEngine:
         self.max_tokens = config.get("max_tokens", 128)
         self.batch_size = config.get("batch_size", 32)
         self.lora_path = config.get("lora_path", None)  # LoRA adapter path
+        self.sampling_seed = config.get("seed", None)   # Optional fixed sampling seed
 
         self.llm = None
         self.tokenizer = None
@@ -82,6 +85,9 @@ class LLMCognitiveEngine:
 
     def initialize(self):
         """Load model and warm up. Call once before simulation starts."""
+        if self._ready:
+            print("[CogEngine] LLM engine already initialized — reusing it.")
+            return
         print(f"[CogEngine] Loading {self.model_name} ...")
         t0 = time.time()
 
@@ -109,12 +115,43 @@ class LLMCognitiveEngine:
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             top_p=0.9,
+            seed=self.sampling_seed,
         )
 
         elapsed = time.time() - t0
         self._ready = True
         print(f"[CogEngine] Model loaded in {elapsed:.1f}s. "
               f"Ready for inference.")
+
+    def set_seed(self, seed=None):
+        """Set the LLM sampling seed for reproducible decisions.
+
+        Rebuilds ``SamplingParams`` so the shared engine can use a different
+        seed per simulation run (e.g. seed = simulation seed), which removes
+        LLM sampling as a source of between-condition noise.
+        """
+        self.sampling_seed = seed
+        if self._ready:
+            from vllm import SamplingParams
+            self.sampling_params = SamplingParams(
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                top_p=0.9,
+                seed=seed,
+            )
+
+    def reset_stats(self):
+        """Clear per-run bookkeeping so a shared engine can be reused.
+
+        Called between simulations when one vLLM engine serves multiple runs:
+        pending agents, collected results and parse-failure counters are
+        reset so the next run starts from a clean slate.
+        """
+        with self._inference_lock:
+            self._pending_agents.clear()
+            self._results.clear()
+            self._total_llm_decisions = 0
+            self._parse_failures = 0
 
     def set_perception_context(self, vlm_description: str = "",
                                 yolo_result=None):
@@ -381,6 +418,8 @@ class LLMCognitiveEngine:
             risk_assessment=data.get("risk_assessment", ""),
             compute_time=compute_time,
             raw_data=data,  # Full parsed JSON for command roles
+            tick=getattr(env, 'tick', 0),
+            source="llm",
         )
 
     def _fallback_decision(self, agent: Agent,
@@ -410,13 +449,14 @@ class LLMCognitiveEngine:
             reasoning=f"[回退] 选择最近出口{best_idx+1}, 距离{best_score:.0f}m",
             risk_assessment="自动评估",
             compute_time=0.0,
+            tick=getattr(env, 'tick', 0),
+            source="llm_fallback",
         )
 
     def shutdown(self):
         """Clean up vLLM resources and free GPU memory (aggressive)."""
         import torch
         import gc
-        import subprocess
         import time
 
         if self.llm:
@@ -433,12 +473,20 @@ class LLMCognitiveEngine:
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
 
-        # vLLM 0.21.0 spawns a separate EngineCore process that may
-        # survive del self.llm. Kill it explicitly to free GPU memory.
+        # vLLM spawns a separate EngineCore process that may survive
+        # `del self.llm`. Clean it up explicitly on every platform.
         try:
-            subprocess.run(
-                ['pkill', '-f', 'EngineCore'],
-                capture_output=True, timeout=5)
+            import psutil
+            current = os.getpid()
+            for proc in psutil.process_iter(['pid', 'cmdline']):
+                try:
+                    if proc.info['pid'] == current:
+                        continue
+                    cmdline = ' '.join(proc.info['cmdline'] or []).lower()
+                    if 'vllm' in cmdline or 'enginecore' in cmdline:
+                        proc.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
         except Exception:
-            pass
+            pass  # psutil unavailable — child processes may survive
         time.sleep(1.5)

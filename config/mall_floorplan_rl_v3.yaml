@@ -97,10 +97,12 @@ irl:
 
 # RL Zone Scheduling — 分区独立 PPO（Zone-PPO） zone-level exit recommendations
 rl_scheduling:
-  enabled: false                          # Enable RL zone scheduler during simulation
-  pretrained_weights: ""                  # Path to pretrained policy weights (empty = heuristic)
+  enabled: true                           # Enable RL zone scheduler during simulation
+  pretrained_weights: "data/rl_policy_v3.json"  # Trained Zone-PPO policy
   irl_weights: "data/irl_weights.json"   # Path to IRL-learned reward weights
   rl_inference_interval: 1                # Ticks between RL inference (1 = every tick)
+  smoke_block_threshold: 0.6              # Exits with smoke > this are never recommended
+  fire_path_block: true                   # Also block exits whose straight-line path crosses fire
 
 # Zone definitions for RL scheduler (4 quadrants of 200m×120m mall)
 zones:

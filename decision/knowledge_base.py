@@ -55,8 +55,11 @@ class DisasterKnowledgeBase:
         # Try to initialize ChromaDB for larger-scale usage
         self._chroma = None
         self._encoder = None
-        if persist_dir:
-            self._init_chroma(persist_dir)
+        self._collection = None
+        self._persist_dir = persist_dir
+        # NOTE: ChromaDB + the embedding model are intentionally NOT loaded
+        # here. Initializing them eagerly forces a model download even for
+        # pure physics runs; init happens lazily on the first query().
 
     def _load_core_knowledge(self):
         """Load the pre-compiled core knowledge."""
@@ -98,15 +101,22 @@ class DisasterKnowledgeBase:
                     embeddings=embeddings.tolist(),
                     ids=ids,
                 )
-        except ImportError:
-            pass  # ChromaDB optional for minimal runs
+        except Exception as e:
+            # ChromaDB / embedding model is optional: degrade to keyword search.
+            self._chroma = None
+            self._encoder = None
+            self._collection = None
+            print(f"[KB] Semantic search unavailable, using keyword fallback: {e}")
 
     def query(self, query: str, disaster_type: str = "general",
               top_k: int = 3) -> List[str]:
         """Retrieve relevant knowledge. Tries ChromaDB semantic search first,
         falls back to keyword matching."""
 
-        if self._chroma and hasattr(self, '_collection') and self._collection.count() > 0:
+        if self._chroma is None and self._persist_dir:
+            self._init_chroma(self._persist_dir)
+
+        if self._chroma and self._collection is not None and self._collection.count() > 0:
             return self._semantic_search(query, top_k)
         else:
             return self._keyword_search(query, disaster_type, top_k)

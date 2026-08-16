@@ -1,15 +1,23 @@
-"""RL Zone Scheduler — P-MAPPO multi-agent zone-level evacuation scheduling.
+"""RL Zone Scheduler — MAPPO-style (CTDE) zone-level evacuation scheduling.
 
 Receives IRL-learned reward weights from LLM behavior, then optimizes
-zone-level exit recommendations using MAPPO-style multi-agent RL.
+zone-level exit recommendations with a multi-agent PPO setup:
 
-Architecture:
-  - 4 zone schedulers, each responsible for one quadrant of the mall
-  - Each scheduler observes zone state (smoke, crowd, exits) and outputs
-    exit preference scores [-1, 1] for each exit
-  - Reward function uses IRL-learned weights per persona category
-  - Training: offline (CTDE — centralized training, decentralized execution)
-  - Inference: < 1ms per tick (lightweight MLP forward pass)
+Architecture (CTDE):
+  - Decentralized actors: one policy MLP per zone. At inference each zone
+    acts only on its own observation (< 1ms/tick per zone).
+  - Centralized critic: a shared state-value MLP over the concatenated
+    observations of ALL zones, used only during offline training.
+  - Team reward: mean of the per-zone IRL-weighted rewards. Each zone's
+    policy is updated with its own GAE advantage that shares the central
+    value function.
+  - The joint policy is factorized Gaussian (product of per-zone policies),
+    so the joint log-probability is the sum of per-zone log-probs.
+
+Historical naming: earlier docs called this "P-MAPPO". With the shared
+central critic and decentralized actors below, the CTDE label is now
+accurate, though the policy remains factorized rather than a full joint
+action model.
 
 The key insight: RL schedulers don't control individual agents directly.
 They output natural-language "advice" that gets injected into LLM prompts —
@@ -24,6 +32,11 @@ from dataclasses import dataclass, field
 from collections import defaultdict
 
 from perception.environment import EnvironmentSnapshot
+from execution.features import (
+    FEATURE_NAMES,
+    blocked_exit_weight,
+    zone_reward_features,
+)
 
 # ================================================================
 # Training constants (overridable via config)
@@ -33,12 +46,23 @@ LAMBDA_GAE = 0.95          # GAE trace decay parameter
 CLIP_EPSILON = 0.2          # PPO clipping range
 VALUE_COEF = 0.5            # Value loss coefficient in total loss
 ENTROPY_COEF = 0.01         # Entropy bonus coefficient
-LEARNING_RATE = 3e-4        # Default learning rate
+# NOTE: v4 analysis (rl_policy_v4 weights) showed the policy head W3_a
+# never left its init scale (max dev ~0.01-0.02 after 500 episodes)
+# while the value head moved ~0.5 — the actor was optimization-starved,
+# not reward-misaligned alone. lr 3e-4 with per-sample normalization and
+# max_norm=1.0 clipping gave per-step updates of ~1e-6. Raised defaults;
+# a local 10-episode smoke at lr=1e-3 reached only delta ~0.003/ep
+# (would need ~500 eps to matter), so lr was raised further to 3e-3.
+LEARNING_RATE = 3e-3        # Default learning rate (was 3e-4)
+GRAD_MAX_NORM = 5.0         # Policy gradient clip (was 1.0)
+CRITIC_EPOCHS = 4           # Critic SGD passes per episode (was 1)
 BATCH_SIZE = 32             # Mini-batch size for PPO updates
-POLICY_SIGMA = 1.0          # Fixed Gaussian policy standard deviation
+POLICY_SIGMA = 0.5          # Fixed Gaussian policy standard deviation
+PPO_EPOCHS = 4              # Reuse each on-policy rollout for stable PPO updates
 HIDDEN_DIM = 64             # Hidden layer dimension for dual-head MLP
 NUM_EPISODES = 200          # Default training episodes
 STEPS_PER_EPISODE = 200     # Default steps per episode
+RL_EXIT_SMOKE_BLOCK = 0.6   # Same as SafetyGuard.EXIT_SMOKE_BLOCK
 
 # ================================================================
 # Zone definitions
@@ -118,19 +142,36 @@ class ZoneAction:
     exit_preferences: List[float]  # [-1, 1] for each exit, -1=avoid, +1=recommend
 
     def to_recommendation_text(self, zone: ZoneDefinition,
-                                exit_count: int) -> str:
-        """Convert action to natural language for LLM prompt injection."""
+                                exit_count: int,
+                                blocked_exits=None) -> str:
+        """Convert action to natural language for LLM prompt injection.
+
+        ``blocked_exits`` is a list of exit indices (0-based) that must not be
+        recommended — typically exits whose smoke exceeds the safety-guard
+        threshold. Their preference is hard-masked to -1.0 so the RL advice
+        never pushes the LLM toward a smoke-blocked exit.
+        """
+        prefs = list(self.exit_preferences[:exit_count])
+        blocked = sorted(
+            int(i) for i in (blocked_exits or [])
+            if 0 <= int(i) < len(prefs)
+        )
+        for i in blocked:
+            prefs[i] = -1.0
+
         lines = [f"【{zone.name}调度中心建议】"]
 
         # Sort exits by preference
         ranked = sorted(
-            enumerate(self.exit_preferences[:exit_count]),
+            enumerate(prefs),
             key=lambda x: x[1], reverse=True
         )
 
         recommend = []
         avoid = []
         for exit_idx, pref in ranked:
+            if exit_idx in blocked:
+                continue  # blocked exits are announced once in the 封锁 line
             exit_label = f"出口{exit_idx + 1}"
             if pref > 0.5:
                 recommend.append(f"强烈推荐 {exit_label}")
@@ -145,21 +186,107 @@ class ZoneAction:
             lines.append("  [推荐] " + "、".join(recommend))
         if avoid:
             lines.append("  [警告] " + "、".join(avoid))
-        if not recommend and not avoid:
+        if blocked:
+            lines.append("  [封锁] " + "、".join(
+                f"出口{i + 1}（浓烟封锁或火路阻断，请勿前往）" for i in blocked))
+        if not recommend and not avoid and not blocked:
             lines.append("  暂无特别建议，各出口均可通行")
 
         return "\n".join(lines)
 
 
 # ================================================================
-# RL Zone Scheduler (P-MAPPO style, lightweight MLP)
+# Centralized critic (MAPPO / CTDE)
+# ================================================================
+
+class CentralizedCritic:
+    """Shared state-value network used only during centralized training.
+
+    Input: concatenated observations of ALL zones (one vector per time step).
+    Output: scalar state value V(s). The critic is not used at execution
+    time — each zone's actor acts on its own observation only (decentralized
+    execution), which is the CTDE pattern.
+    """
+
+    def __init__(self, obs_dim: int, hidden_dim: int = 128, seed: int = 42):
+        rng = np.random.RandomState(seed)
+        scale1 = np.sqrt(2.0 / max(1, obs_dim))
+        scale2 = np.sqrt(2.0 / max(1, hidden_dim))
+        self.W1 = rng.randn(obs_dim, hidden_dim).astype(np.float32) * scale1
+        self.b1 = np.zeros(hidden_dim, dtype=np.float32)
+        self.W2 = rng.randn(hidden_dim, hidden_dim).astype(np.float32) * scale2
+        self.b2 = np.zeros(hidden_dim, dtype=np.float32)
+        self.W3 = rng.randn(hidden_dim, 1).astype(np.float32) * 0.01
+        self.b3 = np.zeros(1, dtype=np.float32)
+
+    def forward(self, obs_concat: np.ndarray) -> float:
+        """Value estimate for a concatenated global observation."""
+        h1 = np.maximum(0, obs_concat.reshape(1, -1) @ self.W1 + self.b1)
+        h2 = np.maximum(0, h1 @ self.W2 + self.b2)
+        return float((h2 @ self.W3 + self.b3).item())
+
+    def update(self, obs_list: List[np.ndarray], returns: List[float],
+               lr: float = 3e-4, max_norm: float = 10.0) -> float:
+        """One SGD step minimizing 0.5 * (V(s) - R)^2 (gradient clipping)."""
+        dW1 = np.zeros_like(self.W1)
+        db1 = np.zeros_like(self.b1)
+        dW2 = np.zeros_like(self.W2)
+        db2 = np.zeros_like(self.b2)
+        dW3 = np.zeros_like(self.W3)
+        db3 = np.zeros_like(self.b3)
+        total_loss = 0.0
+
+        for obs, ret in zip(obs_list, returns):
+            x = obs.reshape(1, -1)
+            h1_pre = x @ self.W1 + self.b1
+            h1 = np.maximum(0, h1_pre)
+            h2_pre = h1 @ self.W2 + self.b2
+            h2 = np.maximum(0, h2_pre)
+            v = float((h2 @ self.W3 + self.b3).item())
+
+            err = v - ret
+            total_loss += 0.5 * err * err
+
+            dL_dv = err
+            dW3 += h2.T * dL_dv
+            db3 += dL_dv
+            dL_dh2 = dL_dv * self.W3.T
+            dL_dh2_pre = dL_dh2 * (h2_pre > 0)
+            dW2 += h1.T @ dL_dh2_pre
+            db2 += dL_dh2_pre.sum(axis=0)
+            dL_dh1 = dL_dh2_pre @ self.W2.T
+            dL_dh1_pre = dL_dh1 * (h1_pre > 0)
+            dW1 += x.T @ dL_dh1_pre
+            db1 += dL_dh1_pre.sum(axis=0)
+
+        n = max(1, len(obs_list))
+        # The loss is averaged over the batch, so the gradient must be too.
+        # Without this normalization, the effective learning rate grows with
+        # episode length and the clip threshold hides the resulting instability.
+        all_grads = [dW1, db1, dW2, db2, dW3, db3]
+        for grad in all_grads:
+            grad /= n
+        total_norm = float(np.sqrt(sum(np.sum(g * g) for g in all_grads)))
+        scale = min(1.0, max_norm / (total_norm + 1e-8))
+        self.W1 -= lr * dW1 * scale
+        self.b1 -= lr * db1 * scale
+        self.W2 -= lr * dW2 * scale
+        self.b2 -= lr * db2 * scale
+        self.W3 -= lr * dW3 * scale
+        self.b3 -= lr * db3 * scale
+        return total_loss / n
+
+
+# ================================================================
+# RL Zone Scheduler (zone-level PPO, lightweight MLP)
 # ================================================================
 
 class RLZoneScheduler:
-    """Zone-level scheduler using trained policy network.
+    """Zone-level scheduler using MAPPO-style CTDE.
 
-    Uses a lightweight MLP policy (not a full transformer) for fast inference.
-    Training is done offline with MAPPO-style centralized critic.
+    Decentralized actors: one lightweight MLP policy per zone.
+    Centralized critic: shared value MLP over all zone observations
+    (training only). Offline training with PPO + GAE.
 
     Runtime: < 1ms per zone (4 × MLP forward pass).
     """
@@ -167,11 +294,20 @@ class RLZoneScheduler:
     def __init__(self, zones: List[ZoneDefinition] = None,
                  num_exits: int = 8,
                  obs_dim: int = None,
-                 hidden_dim: int = 128):
+                 hidden_dim: int = 128,
+                 seed: int = 42,
+                 blocked_exit_penalty: float = 0.0,
+                 smoke_block_threshold: float = 0.6,
+                 outcome_reward_weight: float = 0.0):
         self.zones = zones or DEFAULT_ZONES
         self.num_exits = num_exits
         self.obs_dim = obs_dim or (4 * num_exits + 7)  # smoke + crowd + fire_dist + prev_usage + 7 scalars
         self.hidden_dim = hidden_dim
+        self.seed = int(seed)
+        self.blocked_exit_penalty = blocked_exit_penalty
+        self.smoke_block_threshold = smoke_block_threshold
+        self.outcome_reward_weight = outcome_reward_weight
+        self._rng = np.random.RandomState(self.seed)
 
         # Policy networks (one per zone, or shared with zone-specific head)
         # For now: shared backbone + zone-specific output heads
@@ -186,6 +322,9 @@ class RLZoneScheduler:
         # Pretrained flag: only use MLP if pretrained weights loaded
         self._pretrained_loaded = False
 
+        # Centralized critic (MAPPO / CTDE); created during training.
+        self._critic: Optional[CentralizedCritic] = None
+
     def initialize(self, pretrained_path: str = None):
         """Initialize policy networks.
 
@@ -194,18 +333,24 @@ class RLZoneScheduler:
         """
         if pretrained_path and os.path.exists(pretrained_path):
             self._load_weights(pretrained_path)
+            self._initialized = True
+            print(f"[RLScheduler] Loaded pretrained weights from {pretrained_path}")
         else:
             # Initialize with random weights (heuristic baselines)
             for zone in self.zones:
-                self._policies[zone.zone_id] = self._init_network()
+                # Give zones independent initial noise so identical early
+                # observations do not force permanently identical actors.
+                self._policies[zone.zone_id] = self._init_network(
+                    seed=self.seed + zone.zone_id
+                )
                 self._prev_exit_usage[zone.zone_id] = [0.0] * self.num_exits
-
-        self._initialized = True
-        if pretrained_path:
-            print(f"[RLScheduler] Loaded pretrained weights from {pretrained_path}")
-        else:
-            print(f"[RLScheduler] Initialized with heuristic baselines "
-                  f"({len(self.zones)} zones, {self.num_exits} exits)")
+            self._initialized = True
+            if pretrained_path:
+                print(f"[RLScheduler] WARNING: pretrained weights NOT FOUND at "
+                      f"{pretrained_path} — using heuristic baselines")
+            else:
+                print(f"[RLScheduler] Initialized with heuristic baselines "
+                      f"({len(self.zones)} zones, {self.num_exits} exits)")
 
     def load_irl_weights(self, irl_weights: Dict[str, np.ndarray]):
         """Load IRL-learned reward weights to guide scheduling decisions."""
@@ -213,7 +358,7 @@ class RLZoneScheduler:
         self._use_irl_reward = True
         print(f"[RLScheduler] Loaded IRL weights for {len(irl_weights)} personas")
 
-    def _init_network(self) -> dict:
+    def _init_network(self, seed: int = None) -> dict:
         """Initialize a small 3-layer MLP with separate policy and value heads.
 
         Shared backbone:
@@ -229,7 +374,7 @@ class RLZoneScheduler:
         During inference: action_mean → tanh → [-1, 1] preferences.
         During training: action_mean used directly as Gaussian mean.
         """
-        rng = np.random.RandomState(42)
+        rng = np.random.RandomState(self.seed if seed is None else seed)
         scale1 = np.sqrt(2.0 / self.obs_dim)
         scale2 = np.sqrt(2.0 / self.hidden_dim)
         # Policy head: small init to start near zero (unbiased)
@@ -386,6 +531,70 @@ class RLZoneScheduler:
         preferences = out[0].tolist()[:self.num_exits]
         return ZoneAction(exit_preferences=preferences)
 
+    def _sample_action(self, zone_id: int, obs: ZoneObservation,
+                       sigma: float = POLICY_SIGMA) -> Tuple[ZoneAction, float]:
+        """Sample an action from the Gaussian policy (on-policy training).
+
+        Samples u ~ N(action_mean, sigma^2), applies tanh, and returns the
+        action together with its log-probability (including the tanh
+        Jacobian correction). Used by train_offline so the data actually
+        comes from the policy being optimized.
+        """
+        params = self._policies[zone_id]
+        x = obs.to_vector().reshape(1, -1)
+        h1 = np.maximum(0, x @ params["W1"] + params["b1"])
+        h2 = np.maximum(0, h1 @ params["W2"] + params["b2"])
+        action_mean = h2 @ params["W3_a"] + params["b3_a"]
+
+        noise = self._rng.randn(1, self.num_exits).astype(np.float32) * sigma
+        u = action_mean + noise
+        a = np.tanh(u)
+
+        n_dims = self.num_exits
+        log_prob = (
+            -0.5 * n_dims * np.log(2 * np.pi * sigma ** 2)
+            - 0.5 * np.sum((u - action_mean) ** 2) / sigma ** 2
+            - float(np.sum(np.log(1.0 - a ** 2 + 1e-8)))
+        )
+        return ZoneAction(exit_preferences=a[0].tolist()), float(log_prob)
+
+    def sample_actions(self, env_snapshot, agents, tick: int = 0,
+                       sigma: float = POLICY_SIGMA) -> Tuple[Dict[int, ZoneAction], Dict[int, float]]:
+        """On-policy rollout: sample one action + log-prob per zone."""
+        zone_agents = self._partition_agents(agents)
+
+        actions, log_probs = {}, {}
+        for zone in self.zones:
+            obs = self._build_observation(
+                zone, zone_agents.get(zone.zone_id, []), env_snapshot)
+            act, lp = self._sample_action(zone.zone_id, obs, sigma)
+            actions[zone.zone_id] = act
+            log_probs[zone.zone_id] = lp
+            # The next observation should contain the action actually taken,
+            # not a stale value from a previous episode or deployment run.
+            self._prev_exit_usage[zone.zone_id] = list(act.exit_preferences)
+        return actions, log_probs
+
+    def _reset_action_history(self):
+        """Reset recurrent-like recommendation features at episode start."""
+        self._prev_exit_usage = {
+            zone.zone_id: [0.0] * self.num_exits for zone in self.zones
+        }
+
+    def _partition_agents(self, agents) -> Dict[int, list]:
+        """Group alive/non-evacuated agents into their zone."""
+        zone_agents = defaultdict(list)
+        for a in agents:
+            if not a.dynamic.alive or a.dynamic.evacuated:
+                continue
+            pos = a.position
+            for zone in self.zones:
+                if (zone.x_min <= pos[0] < zone.x_max and
+                    zone.y_min <= pos[1] < zone.y_max):
+                    zone_agents[zone.zone_id].append(a)
+                    break
+        return zone_agents
+
     def _heuristic_action(self, obs: ZoneObservation) -> ZoneAction:
         """Heuristic fallback: prefer exits with low smoke and low crowd.
 
@@ -476,45 +685,68 @@ class RLZoneScheduler:
             self._prev_exit_usage[zid] = [0.0] * self.num_exits
         self._pretrained_loaded = True
 
-    # ---- Training interface (offline, MAPPO-style) ----
+# ---- Training interface (offline, PPO-style) ----
 
     def train_offline(self, env_simulator, episodes: int = 500,
                       steps_per_episode: int = 360,
-                      lr: float = 1e-4, save_path: str = None,
-                      log_interval: int = 5) -> dict:
-        """Complete offline training loop using rule-based fast simulator.
+                      lr: float = LEARNING_RATE, save_path: str = None,
+                      log_interval: int = 5,
+                      history_path: str = None,
+                      ppo_epochs: int = PPO_EPOCHS) -> dict:
+        """Complete offline MAPPO (CTDE) training loop.
 
-        Runs many episodes without LLM — uses heuristic agents for fast rollout.
-        Each episode: simulate `steps_per_episode` ticks, collect experiences,
-        compute IRL-weighted rewards, update policy via PPO.
-
-        Args:
-            env_simulator: A fast simulation environment (not the full orchestrator)
-            episodes: Number of training episodes
-            steps_per_episode: Simulation ticks per episode
-            lr: Learning rate for weight updates
-            save_path: Where to save final policy weights
-            log_interval: Print loss stats every N episodes
-
-        Returns:
-            dict with training history (mean rewards, losses per episode)
+        Each episode:
+          1. For every step, build per-zone observations from the PRE-step
+             state, sample actions from the decentralized policies, and step
+             the fast simulator with those actions.
+          2. Compute per-zone IRL-weighted rewards; the team reward is their
+             mean.
+          3. At episode end, compute GAE advantages for every zone using the
+             SHARED central critic (V over concatenated global observations),
+             update each zone's policy with its own advantage, and update the
+             critic with the mean per-zone returns.
         """
         history = {"episode": [], "mean_reward": [], "policy_loss": [],
-                   "value_loss": [], "evacuation_rate": []}
+                   "value_loss": [], "critic_loss": [], "evacuation_rate": [],
+                   "casualty_rate": [], "episode_return": [],
+                   "policy_head_delta": []}
+
+        # On-policy + CTDE: network rollouts, shared central critic.
+        self._pretrained_loaded = True
+        self._rng = np.random.RandomState(self.seed)
+        critic_obs_dim = self.obs_dim * len(self.zones)
+        self._critic = CentralizedCritic(
+            critic_obs_dim, hidden_dim=self.hidden_dim)
+        low_delta_streak = 0
 
         for ep in range(episodes):
             # Reset simulator state
+            self._reset_action_history()
             env_simulator.reset()
+            policy_head_before = {
+                zid: params["W3_a"].copy()
+                for zid, params in self._policies.items()
+            }
 
             # Experience buffers per zone
             buffers: Dict[int, dict] = {
-                zid: {"obs": [], "acts": [], "rewards": [], "log_probs": []}
+                zid: {"obs": [], "obs_next": [], "acts": [],
+                      "rewards": [], "log_probs": []}
                 for zid in [z.zone_id for z in self.zones]
             }
+            global_states = []       # concatenated pre-step obs (critic input)
+            global_states_next = []  # concatenated post-step obs
+            team_rewards = []
 
             total_reward = 0.0
 
             for step in range(steps_per_episode):
+                evac_before = float(env_simulator.get_evacuation_rate())
+                survival_before = float(
+                    env_simulator.get_survival_rate()
+                    if hasattr(env_simulator, "get_survival_rate") else 1.0
+                )
+
                 # Build pre-step snapshot from current simulator state
                 pre_snap = _FastEnvSnapshot(
                     grid=env_simulator.grid,
@@ -536,120 +768,213 @@ class RLZoneScheduler:
                     trained=env_simulator.agent_trained,
                 )
 
-                # RL inference for all zones
-                zone_actions = self.infer(pre_snap, pre_agents, step)
+                zone_groups = self._partition_agents(pre_agents)
+                pre_obs = {
+                    z.zone_id: self._build_observation(
+                        z, zone_groups.get(z.zone_id, []), pre_snap)
+                    for z in self.zones
+                }
+
+                # RL inference for all zones (sampled, with log-probs)
+                zone_actions, log_probs = self.sample_actions(
+                    pre_snap, pre_agents, step)
 
                 # Step simulator WITH zone actions so RL affects agent behavior
                 env_snap, agents = env_simulator.step(env_simulator.dt, zone_actions)
 
-                # Compute rewards from IRL weights and agent outcomes
+                post_groups = self._partition_agents(agents)
+                post_obs_all = {}
+                step_rewards = []
                 for zone in self.zones:
                     zid = zone.zone_id
-                    z_agents = [a for a in agents
-                                if (a.dynamic.alive and not a.dynamic.evacuated and
-                                    zone.x_min <= a.position[0] < zone.x_max and
-                                    zone.y_min <= a.position[1] < zone.y_max)]
-
-                    obs = self._build_observation(zone, z_agents, env_snap)
+                    z_agents = post_groups.get(zid, [])
+                    post_obs = self._build_observation(zone, z_agents, env_snap)
+                    post_obs_all[zid] = post_obs
                     act = zone_actions[zid]
                     reward = self._compute_zone_reward(zone, z_agents, env_snap, act)
+                    # Log-prob was computed at sampling time (same policy).
+                    old_lp = log_probs[zid]
 
-                    # Log prob of current action under behavior policy
-                    # action_mean is pre-tanh; act.exit_preferences is post-tanh.
-                    # Convert post-tanh action back to pre-tanh for correct log-prob.
-                    params = self._policies[zid]
-                    x = obs.to_vector().reshape(1, -1)
-                    h1 = np.maximum(0, x @ params["W1"] + params["b1"])
-                    h2 = np.maximum(0, h1 @ params["W2"] + params["b2"])
-                    action_mean = h2 @ params["W3_a"] + params["b3_a"]
-                    post_tanh_action = np.array(act.exit_preferences[:self.num_exits])
-                    clipped = np.clip(post_tanh_action, -0.9999, 0.9999)
-                    pre_tanh_action = np.arctanh(clipped)
-                    old_lp = self._gaussian_log_prob(
-                        action_mean[0], pre_tanh_action, sigma=POLICY_SIGMA)
-                    # Tanh Jacobian correction
-                    old_lp -= float(np.sum(np.log(1.0 - clipped ** 2 + 1e-8)))
-
-                    buffers[zid]["obs"].append(obs)
+                    buffers[zid]["obs"].append(pre_obs[zid])
+                    buffers[zid]["obs_next"].append(post_obs)
                     buffers[zid]["acts"].append(act)
                     buffers[zid]["rewards"].append(reward)
                     buffers[zid]["log_probs"].append(old_lp)
-                    total_reward += reward
+                    step_rewards.append(reward)
 
-            # End of episode: compute GAE advantages, then update policy
+                evac_after = float(env_simulator.get_evacuation_rate())
+                survival_after = float(
+                    env_simulator.get_survival_rate()
+                    if hasattr(env_simulator, "get_survival_rate") else survival_before
+                )
+                # The feature reward describes exit quality. Add a bounded
+                # transition term so the policy is also trained on the actual
+                # evacuation objective and casualty risk.
+                transition_bonus = (
+                    5.0 * (evac_after - evac_before)
+                    + 5.0 * (survival_after - survival_before)
+                )
+                team_reward = (
+                    float(np.mean(step_rewards)) if step_rewards else 0.0
+                ) + transition_bonus
+                total_reward += team_reward * len(buffers)
+
+                global_states.append(np.concatenate(
+                    [pre_obs[z.zone_id].to_vector() for z in self.zones]))
+                global_states_next.append(np.concatenate(
+                    [post_obs_all[z.zone_id].to_vector() for z in self.zones]))
+                team_rewards.append(team_reward)
+
+            # End of episode: shared-critic GAE, then update policies + critic
             ep_policy_loss = 0.0
             ep_value_loss = 0.0
-            gamma_gae = GAMMA
-            lambda_gae = LAMBDA_GAE
+            n_policy_samples = 0
+            T = steps_per_episode
+
+            # Central critic values for every stored state
+            V_t = [self._critic.forward(s) for s in global_states]
+            V_next = [self._critic.forward(s) for s in global_states_next]
+
+            # Team-level returns (critic target): GAE over the cooperative
+            # reward. Every actor uses this same advantage so the actor and
+            # centralized critic optimize the same objective.
+            gae_team = 0.0
+            team_advantages = [0.0] * T
+            team_returns = [0.0] * T
+            for t in reversed(range(T)):
+                next_val = V_next[t] if t + 1 < T else 0.0
+                delta = team_rewards[t] + GAMMA * next_val - V_t[t]
+                gae_team = delta + GAMMA * LAMBDA_GAE * gae_team
+                team_advantages[t] = gae_team
+                team_returns[t] = gae_team + V_t[t]
+
+            # Divide by std only — do NOT subtract the mean. Zero-mean
+            # normalization cancels the (already weak) directional team
+            # signal and was one of the causes of the v4 policy stall.
+            adv_std = float(np.std(team_advantages)) + 1e-8
+            normalized_advantages = [
+                adv / adv_std for adv in team_advantages
+            ]
 
             for zid in buffers:
                 buf = buffers[zid]
                 if not buf["obs"]:
                     continue
 
-                # Compute values for all states in buffer
-                buf_values = []
-                for obs in buf["obs"]:
-                    params = self._policies[zid]
-                    x = obs.to_vector().reshape(1, -1)
-                    h1 = np.maximum(0, x @ params["W1"] + params["b1"])
-                    h2 = np.maximum(0, h1 @ params["W2"] + params["b2"])
-                    v = float((h2 @ params["W3_v"] + params["b3_v"]).item())
-                    buf_values.append(v)
+                n_steps = len(buf["rewards"])
 
-                # GAE: A_t = δ_t + γλ δ_{t+1} + (γλ)^2 δ_{t+2} + ...
-                # δ_t = r_t + γ V(s_{t+1}) - V(s_t)
-                T = len(buf["rewards"])
-                gae = 0.0
-                buf_advantages = [0.0] * T
-                buf_returns = [0.0] * T
-                for t in reversed(range(T)):
-                    next_val = buf_values[t + 1] if t + 1 < T else 0.0
-                    delta = buf["rewards"][t] + gamma_gae * next_val - buf_values[t]
-                    gae = delta + gamma_gae * lambda_gae * gae
-                    buf_advantages[t] = gae
-                    buf_returns[t] = gae + buf_values[t]
+                # PPO reuses this fixed on-policy buffer for a few epochs.
+                # The stored old log-probabilities remain unchanged across
+                # epochs; the ratio therefore provides the PPO trust region.
+                for _ in range(max(1, int(ppo_epochs))):
+                    indices = self._rng.permutation(n_steps)
+                    for start in range(0, n_steps, BATCH_SIZE):
+                        batch_idx = indices[start:start + BATCH_SIZE]
+                        batch_obs = [buf["obs"][i] for i in batch_idx]
+                        batch_acts = [buf["acts"][i] for i in batch_idx]
+                        batch_adv = [normalized_advantages[i] for i in batch_idx]
+                        batch_ret = [team_returns[i] for i in batch_idx]
+                        batch_lp = [buf["log_probs"][i] for i in batch_idx]
 
-                # Normalize advantages within buffer
-                adv_mean = float(np.mean(buf_advantages))
-                adv_std = float(np.std(buf_advantages)) + 1e-8
-                buf_advantages = [(a - adv_mean) / adv_std for a in buf_advantages]
+                        loss = self._train_step(
+                            zid, batch_obs, batch_acts,
+                            batch_adv, batch_ret, batch_lp, lr
+                        )
+                        batch_size = len(batch_idx)
+                        ep_policy_loss += loss["policy_loss"] * batch_size
+                        ep_value_loss += loss["value_loss"] * batch_size
+                        n_policy_samples += batch_size
 
-                # Train in mini-batches of 32
-                n = T
-                indices = np.random.permutation(n)
-                for start in range(0, n, 32):
-                    batch_idx = indices[start:start + 32]
-                    batch_obs = [buf["obs"][i] for i in batch_idx]
-                    batch_acts = [buf["acts"][i] for i in batch_idx]
-                    batch_adv = [buf_advantages[i] for i in batch_idx]
-                    batch_ret = [buf_returns[i] for i in batch_idx]
-                    batch_lp = [buf["log_probs"][i] for i in batch_idx]
-
-                    loss = self._train_step(zid, batch_obs, batch_acts,
-                                            batch_adv, batch_ret, batch_lp, lr)
-                    ep_policy_loss += loss["policy_loss"]
-                    ep_value_loss += loss["value_loss"]
+            # Update the shared critic with team-level returns. A single
+            # SGD step per episode under-fits V (value loss stalls ~10),
+            # which keeps the GAE advantages too noisy to move the actor.
+            critic_loss = 0.0
+            for _ in range(CRITIC_EPOCHS):
+                critic_loss = self._critic.update(
+                    global_states, team_returns, lr=lr)
 
             n_zones = len(buffers)
             mean_r = total_reward / max(1, steps_per_episode * n_zones)
             evac_rate = env_simulator.get_evacuation_rate()
 
             history["episode"].append(ep)
-            history["mean_reward"].append(mean_r)
-            history["policy_loss"].append(ep_policy_loss / max(1, n_zones))
-            history["value_loss"].append(ep_value_loss / max(1, n_zones))
-            history["evacuation_rate"].append(evac_rate)
+            history["mean_reward"].append(float(mean_r))
+            history["policy_loss"].append(
+                float(ep_policy_loss / max(1, n_policy_samples))
+            )
+            history["value_loss"].append(
+                float(ep_value_loss / max(1, n_policy_samples))
+            )
+            history["critic_loss"].append(critic_loss)
+            history["evacuation_rate"].append(float(evac_rate))
+            history["casualty_rate"].append(float(
+                env_simulator.get_casualty_rate()
+                if hasattr(env_simulator, "get_casualty_rate") else 0.0
+            ))
+            history["episode_return"].append(float(total_reward))
+            history["policy_head_delta"].append(float(max(
+                np.max(np.abs(self._policies[zid]["W3_a"]
+                              - policy_head_before[zid]))
+                for zid in policy_head_before
+            )))
+
+            # Optimization-stall monitor: if the policy head barely moves
+            # for 100 consecutive episodes the reward/advantage signal is
+            # too weak to matter (the v4 failure mode). Warn early instead
+            # of burning the full budget and discovering it post-hoc.
+            if history["policy_head_delta"][-1] < 1e-3:
+                low_delta_streak += 1
+                if low_delta_streak == 100:
+                    print("[RL Train] WARNING: policy_head_delta < 1e-3 for "
+                          "100 consecutive episodes — optimization likely "
+                          "stalled. Consider raising lr or loosening "
+                          "gradient clipping.")
+            else:
+                low_delta_streak = 0
 
             if ep % log_interval == 0 or ep == episodes - 1:
                 print(f"[RL Train] Ep {ep:4d}/{episodes} | "
                       f"MeanR: {mean_r:+.4f} | "
                       f"PolicyLoss: {history['policy_loss'][-1]:.4f} | "
                       f"ValueLoss: {history['value_loss'][-1]:.4f} | "
+                      f"CriticLoss: {critic_loss:.4f} | "
+                      f"PolicyDelta: {history['policy_head_delta'][-1]:.6f} | "
                       f"Evac: {evac_rate:.1%}")
 
         if save_path:
             self.save_weights(save_path)
+            history_path = history_path or f"{save_path}.history.json"
+
+        if history_path:
+            os.makedirs(
+                os.path.dirname(history_path) or ".", exist_ok=True
+            )
+            payload = {
+                "metadata": {
+                    "format_version": 2,
+                    "algorithm": "zone-ppo-ctde",
+                    "seed": self.seed,
+                    "episodes": episodes,
+                    "steps_per_episode": steps_per_episode,
+                    "learning_rate": lr,
+                    "ppo_epochs": int(ppo_epochs),
+                    "gamma": GAMMA,
+                    "gae_lambda": LAMBDA_GAE,
+                    "clip_epsilon": CLIP_EPSILON,
+                    "policy_sigma": POLICY_SIGMA,
+                    "obs_dim": self.obs_dim,
+                    "hidden_dim": self.hidden_dim,
+                    "num_exits": self.num_exits,
+                    "zone_ids": [zone.zone_id for zone in self.zones],
+                    "simulator_seed": getattr(env_simulator, "seed", None),
+                },
+                "history": history,
+            }
+            with open(history_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        # After training completes, the network is the deployed policy:
+        # enable MLP inference for the remainder of this process.
+        self._pretrained_loaded = True
 
         return history
 
@@ -657,7 +982,8 @@ class RLZoneScheduler:
                     actions: List[ZoneAction],
                     advantages: List[float],
                     returns: List[float],
-                    old_log_probs: List[float], lr: float = 3e-4) -> dict:
+                    old_log_probs: List[float],
+                    lr: float = LEARNING_RATE) -> dict:
         """Single PPO update for one zone with analytical backpropagation.
 
         Network (shared backbone + dual head):
@@ -732,7 +1058,10 @@ class RLZoneScheduler:
                           - 0.5 * np.sum(diff ** 2) / sigma_sq
                           - tanh_correction)
 
-            ratio = float(np.exp(np.clip(new_lp - old_lp, -20.0, 20.0)))
+            # Keep the ratio numerically bounded. With a correct on-policy
+            # rollout it should be close to 1 before the update; a large
+            # value indicates a broken buffer or an overly large step.
+            ratio = float(np.exp(np.clip(new_lp - old_lp, -10.0, 10.0)))
             # Use pre-computed GAE advantage (not raw reward)
             adv_scalar = float(adv)
 
@@ -755,18 +1084,16 @@ class RLZoneScheduler:
             d_ratio = ratio * d_new_lp                     # (1, n_exits)
 
             # Determine which PPO branch is active
-            ratio_clipped = (ratio < 1.0 - clip_epsilon - 1e-9 or
-                            ratio > 1.0 + clip_epsilon + 1e-9)
-
-            if surr1 <= surr2:
-                # Unclipped branch: dL_p/dμ = -A * ratio * (a-μ)/σ²
-                d_policy = -adv_scalar * d_ratio            # (1, n_exits)
-            elif ratio_clipped:
-                # Clipped branch, ratio outside bounds: gradient is 0
-                d_policy = np.zeros_like(action_mean)
-            else:
-                # Ratio within bounds: clip(ratio)=ratio, same gradient as unclipped
-                d_policy = -adv_scalar * d_ratio
+            # The unclipped branch is active when it is the minimum PPO
+            # surrogate. This explicit condition handles both signs of A.
+            use_unclipped = (
+                (adv_scalar >= 0.0 and ratio <= 1.0 + clip_epsilon)
+                or (adv_scalar < 0.0 and ratio >= 1.0 - clip_epsilon)
+            )
+            d_policy = (
+                -adv_scalar * d_ratio
+                if use_unclipped else np.zeros_like(action_mean)
+            )
 
             dL_daction = d_policy / batch_size             # normalize by batch
 
@@ -807,7 +1134,7 @@ class RLZoneScheduler:
         # ---- Gradient clipping (prevent NaN from exploding gradients) ----
         all_grads = [dW1, db1, dW2, db2, dW3_a, db3_a, dW3_v, db3_v]
         total_norm = float(np.sqrt(sum(np.sum(g * g) for g in all_grads)))
-        max_norm = 10.0
+        max_norm = GRAD_MAX_NORM
         scale = min(1.0, max_norm / (total_norm + 1e-8))
         dW1 *= scale; db1 *= scale; dW2 *= scale; db2 *= scale
         dW3_a *= scale; db3_a *= scale; dW3_v *= scale; db3_v *= scale
@@ -847,47 +1174,78 @@ class RLZoneScheduler:
         else:
             all_w = np.array([0.30, 0.35, 0.15, 0.10, 0.10])  # default balanced
 
-        # Compute features
-        # f0: safety — low smoke + far from fire at recommended exits
-        n_exits = len(env_snap.exits)
-        top_exit = int(np.argmax(act.exit_preferences[:n_exits]))
-        exit_smoke = float(env_snap.smoke_at(
-            np.array(env_snap.exits[top_exit], dtype=np.float64)))
-        safety = 1.0 - exit_smoke
+        # Single source of truth: execution.features
+        features = zone_reward_features(zone, zone_agents, env_snap, act)
+        reward = float(np.dot(all_w, features))
+        if self.blocked_exit_penalty > 0:
+            sample_pos = np.asarray(
+                [a.position for a in zone_agents[:40]], dtype=np.float64)
+            smoke_b, path_b = _vectorized_blocked_exits(
+                sample_pos, env_snap, self.smoke_block_threshold)
+            blocked_any = smoke_b | path_b.any(axis=0)
+            reward -= self.blocked_exit_penalty * blocked_exit_weight(
+                env_snap, act, self.smoke_block_threshold,
+                blocked_exits=np.where(blocked_any)[0].tolist())
+        if self.outcome_reward_weight > 0:
+            reward += self.outcome_reward_weight * self._outcome_shaping(
+                zone_agents, env_snap, act)
+        return reward
 
-        # f1: efficiency — recommended exit distance relative to nearest
-        top_pos = np.array(env_snap.exits[top_exit], dtype=np.float64)
-        avg_dist = np.mean([np.linalg.norm(a.position - top_pos) for a in zone_agents[:20]])
-        efficiency = 1.0 - min(1.0, avg_dist / 150.0)
+    def _outcome_shaping(self, zone_agents, env_snap,
+                         act: ZoneAction = None) -> float:
+        """Dense outcome-oriented shaping: closeness + survival + stamina.
 
-        # f2: social — low crowd at recommended exit
-        crowd = sum(1 for a in zone_agents
-                    if a.dynamic.target_exit is not None
-                    and np.linalg.norm(a.dynamic.target_exit - top_pos) < 2.0)
-        social = 1.0 - min(1.0, crowd / max(1, n))
+        Ties the zone reward to actual evacuation progress instead of only
+        the immediate quality of the recommendation vector.
 
-        # f3: conformity — preference consistency with majority
-        if zone_agents:
-            majority_exit = max(
-                set(a.dynamic.target_exit_idx for a in zone_agents
-                    if a.dynamic.target_exit_idx is not None),
-                key=lambda e: sum(1 for a in zone_agents
-                                  if a.dynamic.target_exit_idx == e),
-                default=top_exit,
-            )
-            conformity = 1.0 if top_exit == majority_exit else 0.0
+        Closeness is measured against the softmax-weighted target point of
+        the RECOMMENDED exits (not the arbitrary nearest exit), so the
+        shaping assigns credit to the action itself. Stamina is scored as
+        the fraction of agents with stamina > 30 (a survival indicator);
+        using raw mean stamina would reward keeping agents idle, since
+        stamina drains while moving.
+        """
+        sample = zone_agents[:20]
+        m = len(sample)
+        if m == 0:
+            return 0.0
+        exits = np.asarray(
+            [(float(e[0]), float(e[1])) for e in env_snap.exits],
+            dtype=np.float64)
+        if len(exits) == 0:
+            return 0.0
+        grid_h, grid_w = env_snap.grid.shape[:2]
+        maxd = max(1.0, np.hypot(grid_w * env_snap.grid_resolution,
+                                 grid_h * env_snap.grid_resolution) / 2.0)
+
+        # Softmax over the recommendation → weighted target point.
+        n_exits = len(exits)
+        if act is not None:
+            prefs = np.asarray(
+                act.exit_preferences[:n_exits], dtype=np.float64)
+            if prefs.size < n_exits:
+                prefs = np.pad(prefs, (0, n_exits - prefs.size),
+                               constant_values=0.0)
+            logits = (prefs - np.max(prefs)) / 0.5
+            exit_weights = np.exp(logits)
+            exit_weights /= max(exit_weights.sum(), 1e-12)
         else:
-            conformity = 0.5
+            exit_weights = np.ones(n_exits) / n_exits
+        target = (exit_weights[:, None] * exits).sum(axis=0)
 
-        # f4: comfort — low smoke path
-        comfort = safety  # Simplified: comfort ≈ safety of route
-
-        features = np.array([safety, efficiency, social, conformity, comfort])
-
-        # Normalize features to [0, 1]
-        features = np.clip(features, 0.0, 1.0)
-
-        return float(np.dot(all_w, features))
+        dists = []
+        smoke_sum = 0.0
+        stamina_ok = 0
+        for a in sample:
+            p = np.asarray(a.position, dtype=np.float64)
+            dists.append(float(np.linalg.norm(target - p)))
+            smoke_sum += float(env_snap.smoke_at(p))
+            if getattr(a.dynamic, "stamina", 100.0) > 30.0:
+                stamina_ok += 1
+        closeness = 1.0 - (float(np.mean(dists)) / maxd)
+        return (0.4 * closeness
+                + 0.3 * (1.0 - smoke_sum / m)
+                + 0.3 * (stamina_ok / m))
 
     @staticmethod
     def _gaussian_log_prob(mean: np.ndarray, action: np.ndarray,
@@ -914,7 +1272,9 @@ class RLZoneScheduler:
 def inject_rl_preferences(zone_actions: Dict[int, ZoneAction],
                           zones: List[ZoneDefinition],
                           agent,
-                          env_snapshot: EnvironmentSnapshot) -> str:
+                          env_snapshot: EnvironmentSnapshot,
+                          smoke_block_threshold: float = RL_EXIT_SMOKE_BLOCK,
+                          fire_path_block: bool = True) -> str:
     """Generate RL scheduling advice for a specific agent's LLM prompt.
 
     Finds which zone the agent is in and returns the zone's recommendation
@@ -936,10 +1296,87 @@ def inject_rl_preferences(zone_actions: Dict[int, ZoneAction],
         if (zone.x_min <= pos[0] < zone.x_max and
             zone.y_min <= pos[1] < zone.y_max):
             if zone.zone_id in zone_actions:
+                # Hard-mask exits that the safety guard would block later:
+                # (1) exit itself is smoke-blocked, or
+                # (2) the straight-line path to the exit crosses fire
+                #     (mirrors SafetyGuard._check_fire_proximity).
+                blocked = []
+                for i, ep in enumerate(env_snapshot.exits):
+                    ep_arr = np.array(ep, dtype=np.float64)
+                    smoke_blocked = (
+                        float(env_snapshot.smoke_at(ep_arr))
+                        > smoke_block_threshold)
+                    path_blocked = (
+                        fire_path_block
+                        and _path_crosses_fire(pos, ep_arr, env_snapshot))
+                    if smoke_blocked or path_blocked:
+                        blocked.append(i)
                 return zone_actions[zone.zone_id].to_recommendation_text(
-                    zone, len(env_snapshot.exits))
+                    zone, len(env_snapshot.exits), blocked_exits=blocked)
 
     return ""
+
+
+def _path_crosses_fire(agent_pos, exit_pos, env_snapshot,
+                       max_steps: int = 400) -> bool:
+    """Sample the straight line agent→exit and return True if it hits fire.
+
+    Uses the same sampling density as SafetyGuard._check_fire_proximity
+    (at least 2 samples per meter, capped at ``max_steps``) so the RL advice
+    filter and the safety guard agree on what counts as a fire-blocked route.
+    """
+    dist = float(np.linalg.norm(exit_pos - agent_pos))
+    steps = min(max(8, int(dist * 2)), max_steps)
+    for t in range(steps + 1):
+        alpha = t / steps
+        px = agent_pos[0] + alpha * (exit_pos[0] - agent_pos[0])
+        py = agent_pos[1] + alpha * (exit_pos[1] - agent_pos[1])
+        if env_snapshot.is_on_fire(np.array([px, py], dtype=np.float64)):
+            return True
+    return False
+
+
+def _vectorized_blocked_exits(positions, env_snapshot,
+                              smoke_block_threshold: float = 0.6,
+                              samples: int = 16):
+    """Vectorized smoke + fire-path blocked-exit mask.
+
+    Returns ``(smoke_blocked[E], path_blocked[M, E])``:
+      - smoke_blocked: exit itself has smoke above the threshold;
+      - path_blocked:  the straight line from an agent to that exit crosses
+                       fire (same semantics as the inference-time filter and
+                       SafetyGuard._check_fire_proximity).
+    """
+    exits = np.asarray(
+        [(float(e[0]), float(e[1])) for e in env_snapshot.exits],
+        dtype=np.float64)
+    e_count = len(exits)
+    smoke_blocked = np.asarray([
+        float(env_snapshot.smoke_at(
+            np.asarray(e, dtype=np.float64))) > smoke_block_threshold
+        for e in env_snapshot.exits
+    ], dtype=bool)
+
+    m_count = len(positions)
+    path_blocked = np.zeros((m_count, e_count), dtype=bool)
+    if m_count == 0 or e_count == 0:
+        return smoke_blocked, path_blocked
+
+    pos = np.asarray(positions, dtype=np.float64).reshape(m_count, 2)
+    seg = exits[None, :, :] - pos[:, None, :]              # (M,E,2)
+    ts = np.linspace(0.0, 1.0, samples + 1)[None, None, :]
+    pts = (pos[:, None, None, :] + seg[:, :, None, :] * ts[..., None])
+    res = env_snapshot.grid_resolution
+    cols = (pts[..., 0] / res).astype(np.int64)
+    rows = (pts[..., 1] / res).astype(np.int64)
+    h, w = env_snapshot.grid.shape[:2]
+    valid = (cols >= 0) & (cols < w) & (rows >= 0) & (rows < h)
+    rr = np.clip(rows, 0, h - 1)
+    cc = np.clip(cols, 0, w - 1)
+    on_fire = env_snapshot.grid[rr, cc, 3] > 0.5
+    on_fire = on_fire & valid
+    path_blocked = on_fire.any(axis=2)
+    return smoke_blocked, path_blocked
 
 
 # ================================================================
@@ -960,7 +1397,11 @@ class FastTrainingSimulator:
                  num_agents: int = 600, num_exits: int = 8,
                  zone_defs: List[ZoneDefinition] = None,
                  exit_positions: List[Tuple[float, float]] = None,
-                 seed: int = 42):
+                 seed: int = 42,
+                 fire_sources: List[Tuple[float, float]] = None,
+                 spread_rate: float = None,
+                 origin_jitter: float = 15.0,
+                 smoke_block_threshold: float = 0.6):
         self.width = width
         self.height = height
         self.num_agents = num_agents
@@ -968,8 +1409,15 @@ class FastTrainingSimulator:
         self.zones = zone_defs or DEFAULT_ZONES
         self.dt = 1.0   # Coarse step for fast RL training (10× fewer steps)
         self.tick = 0
+        self.seed = int(seed)
+        self._episode_index = 0
+        # Extreme-mode parameters (None keeps the legacy spread behavior).
+        self.spread_rate = spread_rate
+        self.origin_jitter = origin_jitter
+        self.smoke_block_threshold = smoke_block_threshold
 
-        rng = np.random.RandomState(seed)
+        rng = np.random.RandomState(self.seed)
+        self._rng = rng
 
         # Use provided exit positions, or generate evenly-spaced perimeter positions
         if exit_positions is not None:
@@ -994,15 +1442,22 @@ class FastTrainingSimulator:
         self.grid = np.zeros((self.grid_h, self.grid_w, 5), dtype=np.float32)
 
         # Fire origins — place near 2 exits to create genuine pressure
-        if len(self.exit_positions) >= 4:
+        if fire_sources is not None:
+            self.fire_sources = [
+                (float(ox), float(oy)) for ox, oy in fire_sources
+            ]
+            self.fire_origins = self.fire_sources
+        elif len(self.exit_positions) >= 4:
             ex0 = np.array(self.exit_positions[0])
             ex3 = np.array(self.exit_positions[3])
-            self.fire_origins = [
+            self.fire_sources = [
                 (ex0[0] + 15.0, ex0[1] + 15.0),
                 (ex3[0] - 15.0, ex3[1] - 15.0),
             ]
+            self.fire_origins = self.fire_sources
         else:
-            self.fire_origins = [(width / 2, height / 2)]
+            self.fire_sources = [(width / 2, height / 2)]
+            self.fire_origins = self.fire_sources
         self._init_fire(rng)
 
         # Agent states (simple Position-Velocity agents)
@@ -1025,9 +1480,15 @@ class FastTrainingSimulator:
             self.agent_target_exits[i] = rng.randint(0, num_exits)
 
         self._initial_positions = self.agent_positions.copy()
+        self._initial_stamina = self.agent_stamina.copy()
+        self._initial_fear = self.agent_fear.copy()
+        self._initial_target_exits = self.agent_target_exits.copy()
 
     def _init_fire(self, rng):
-        for ox, oy in self.fire_origins:
+        # Fire and smoke are episode state. Clear the previous episode before
+        # placing the new sources; otherwise reset() accumulates hazards.
+        self.grid.fill(0.0)
+        for ox, oy in self._sample_fire_origins(rng):
             fx = int(ox / self.grid_res)
             fy = int(oy / self.grid_res)
             for dy in range(-6, 7):
@@ -1038,13 +1499,28 @@ class FastTrainingSimulator:
                             self.grid[py, px, 3] = 0.8 + rng.random() * 0.2
                             self.grid[py, px, 0] = 0.3 + rng.random() * 0.2
 
+    def _sample_fire_origins(self, rng):
+        """Jitter the base fire sources each episode (extreme mode)."""
+        if self.origin_jitter <= 0:
+            return list(self.fire_sources)
+        return [
+            (ox + rng.uniform(-self.origin_jitter, self.origin_jitter),
+             oy + rng.uniform(-self.origin_jitter, self.origin_jitter))
+            for ox, oy in self.fire_sources
+        ]
+
     def reset(self):
+        self._episode_index += 1
+        self._rng = np.random.RandomState(self.seed + self._episode_index)
         self.tick = 0
         self.agent_positions = self._initial_positions.copy()
         self.agent_velocities.fill(0)
         self.agent_alive.fill(True)
         self.agent_evacuated.fill(False)
-        self._init_fire(np.random.RandomState(42))
+        self.agent_stamina = self._initial_stamina.copy()
+        self.agent_fear = self._initial_fear.copy()
+        self.agent_target_exits = self._initial_target_exits.copy()
+        self._init_fire(self._rng)
 
     def step(self, dt: float, zone_actions: dict = None):
         """Run one tick: spread fire/smoke, move agents.
@@ -1055,28 +1531,66 @@ class FastTrainingSimulator:
         """
         self.tick += 1
 
-        # Spread fire and smoke every tick (dt=1.0, so every 1.0 simulated second)
         fire = self.grid[:, :, 3]
-        sources = np.where(fire > 0.5, fire * 0.85, 0.0).astype(np.float32)
+        if self.spread_rate is None:
+            # Legacy fast spread (backward compatibility)
+            sources = np.where(fire > 0.5, fire * 0.85, 0.0).astype(np.float32)
+            up = np.zeros_like(fire); up[:-1, :] = sources[1:, :]
+            down = np.zeros_like(fire); down[1:, :] = sources[:-1, :]
+            left = np.zeros_like(fire); left[:, :-1] = sources[:, 1:]
+            right = np.zeros_like(fire); right[:, 1:] = sources[:, :-1]
+            rand_mask = self._rng.random(fire.shape).astype(np.float32) < 0.40
+            incoming = np.where(
+                rand_mask, np.maximum.reduce([up, down, left, right]), 0.0)
+            self.grid[:, :, 3] = np.maximum(fire, incoming)
+            self.grid[:, :, 0] = np.maximum(
+                self.grid[:, :, 0] * 0.85, self.grid[:, :, 3] * 0.6)
+        else:
+            # Deployment-like spread: same 8-neighbour CA ignition
+            # probability as DisasterSimulator (spread_rate m/s).
+            ignite_prob = min(
+                1.0, self.spread_rate * dt / (3.0 * self.grid_res))
+            fire_mask = fire > 0.5
+            h, w = fire_mask.shape
+            padded = np.pad(fire_mask, 1, mode="constant",
+                            constant_values=False)
+            new_fire = fire_mask.copy()
+            for dr, dc in [(-1,-1), (-1,0), (-1,1), (0,-1), (0,1),
+                           (1,-1), (1,0), (1,1)]:
+                neighbor = padded[1+dr:1+dr+h, 1+dc:1+dc+w]
+                candidates = neighbor & ~fire_mask
+                new_fire |= candidates & (
+                    self._rng.random(fire_mask.shape) < ignite_prob)
+            self.grid[:, :, 3] = new_fire.astype(np.float32)
 
-        # Spread from 4 directions into target cell
-        up = np.zeros_like(fire)
-        up[:-1, :] = sources[1:, :]
-        down = np.zeros_like(fire)
-        down[1:, :] = sources[:-1, :]
-        left = np.zeros_like(fire)
-        left[:, :-1] = sources[:, 1:]
-        right = np.zeros_like(fire)
-        right[:, 1:] = sources[:, :-1]
+            # Smoke: diffusion first, then production (matches
+            # DisasterSimulator; production-before-diffusion would saturate
+            # burning neighborhoods at ~0.5 instead of 1.0).
+            smoke = self.grid[:, :, 0]
+            smoke_pad = np.pad(smoke, 1, mode="edge")
+            smoke = (
+                smoke * 0.6 +
+                0.1 * (smoke_pad[2:, 1:-1] + smoke_pad[:-2, 1:-1] +
+                       smoke_pad[1:-1, 2:] + smoke_pad[1:-1, :-2])
+            )
+            smoke = smoke + self.grid[:, :, 3] * 0.05 * dt
+            self.grid[:, :, 0] = np.clip(smoke, 0.0, 1.0)
 
-        rand_mask = np.random.random(fire.shape).astype(np.float32) < 0.40
-        incoming = np.where(rand_mask, np.maximum.reduce([up, down, left, right]), 0.0)
-
-        self.grid[:, :, 3] = np.maximum(fire, incoming)
-        self.grid[:, :, 0] = np.maximum(
-            self.grid[:, :, 0] * 0.85,
-            self.grid[:, :, 3] * 0.6,
-        )
+        # Deployment-like advice masking: when zone advice is active, block
+        # exits whose smoke exceeds the threshold OR whose straight-line path
+        # crosses fire — exactly what the inference-time advice filter does.
+        blocked = None
+        if zone_actions is not None:
+            pre_snap = _FastEnvSnapshot(
+                grid=self.grid,
+                grid_resolution=self.grid_res,
+                exits=self.exit_positions,
+                timestamp=self.tick * dt,
+                disaster_type="fire",
+                official_broadcast="",
+            )
+            blocked = _vectorized_blocked_exits(
+                self.agent_positions, pre_snap, self.smoke_block_threshold)
 
         # Move agents toward their chosen exits
         for i in range(self.num_agents):
@@ -1117,6 +1631,9 @@ class FastTrainingSimulator:
             if self.tick % 3 == 0:
                 best_exit = self.agent_target_exits[i]
                 best_score = float("inf")
+                all_blocked = True
+                min_smoke_idx = best_exit
+                min_smoke_val = float("inf")
                 for e in range(self.num_exits):
                     epos = np.array(self.exit_positions[e], dtype=np.float32)
                     d = float(np.linalg.norm(self.agent_positions[i] - epos))
@@ -1126,6 +1643,14 @@ class FastTrainingSimulator:
                     smoke = 0.0
                     if 0 <= ex < self.grid_w and 0 <= ey < self.grid_h:
                         smoke = float(self.grid[ey, ex, 0])
+                    if smoke < min_smoke_val:
+                        min_smoke_val = smoke
+                        min_smoke_idx = e
+                    path_blocked = (
+                        blocked is not None and blocked[1][i, e])
+                    if smoke > self.smoke_block_threshold or path_blocked:
+                        continue  # Smoke-blocked exit: skip unless all blocked
+                    all_blocked = False
                     heuristic_score = d + smoke * 200
 
                     # Blend with zone recommendation if available
@@ -1143,6 +1668,8 @@ class FastTrainingSimulator:
                     if score < best_score:
                         best_score = score
                         best_exit = e
+                if all_blocked:
+                    best_exit = min_smoke_idx
                 self.agent_target_exits[i] = best_exit
 
         # Build a minimal EnvironmentSnapshot-compatible object
@@ -1173,6 +1700,15 @@ class FastTrainingSimulator:
     def get_evacuation_rate(self) -> float:
         n_evac = int(self.agent_evacuated.sum())
         return n_evac / max(1, self.num_agents)
+
+    def get_survival_rate(self) -> float:
+        """Fraction of agents still alive, including evacuated agents."""
+        return float(self.agent_alive.sum()) / max(1, self.num_agents)
+
+    def get_casualty_rate(self) -> float:
+        """Fraction of agents killed by the simulated hazard."""
+        casualties = (~self.agent_alive & ~self.agent_evacuated).sum()
+        return float(casualties) / max(1, self.num_agents)
 
 
 class _FastEnvSnapshot:

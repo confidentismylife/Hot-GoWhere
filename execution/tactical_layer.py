@@ -17,6 +17,7 @@ Neurorobotics 2026), ScaleSim sparse activation (2025).
 import numpy as np
 from typing import List, Tuple, Optional
 from decision.agent_state import Agent, Speed, Cooperation
+from decision.policy import HeuristicPolicy
 from perception.environment import EnvironmentSnapshot
 
 
@@ -197,8 +198,10 @@ class TacticalLayer:
 
         if best_idx is not None:
             agent.dynamic.target_exit = np.array(exits[best_idx], dtype=np.float64)
+            agent.dynamic.target_exit_idx = best_idx
             # Don't change target_exit_idx here — it's not stored on AgentDynamic
-            # The heuristic decision block will update it properly at decision time
+            # (kept in sync above; the heuristic decision block refreshes it
+            #  at the next decision time)
 
     # ==================================================================
     # Heuristic decision (for non-critical agents at decision boundary)
@@ -206,47 +209,16 @@ class TacticalLayer:
 
     @classmethod
     def heuristic_decision(cls, agent: Agent, env: EnvironmentSnapshot,
-                           exits: List[Tuple[float, float]]) -> dict:
+                           exits: List[Tuple[float, float]],
+                           tick: int = 0) -> dict:
         """Generate a heuristic exit choice for non-critical agents.
 
-        Uses the same scoring as SFM baseline: distance + smoke penalty.
-        Returns a dict compatible with _apply_decisions expectations.
+        Delegates to the unified HeuristicPolicy so all decision sources
+        share one scoring formula.
         """
-        from decision.cognitive_engine import DecisionResult
-
-        pos = agent.dynamic.position
-        best_idx = 0
-        best_score = float('inf')
-
-        for i, ex in enumerate(exits):
-            ex_arr = np.array(ex, dtype=np.float64)
-            dist = float(np.linalg.norm(pos - ex_arr))
-            smoke = float(env.smoke_at(ex_arr))
-            if smoke > cls.EXIT_SMOKE_BLOCK:
-                continue
-            score = dist * (1.0 + smoke * 3.0)
-            if score < best_score:
-                best_score = score
-                best_idx = i
-
-        local_smoke = float(env.smoke_at(pos))
-        if local_smoke > 0.6:
-            spd = Speed.CRAWL
-        elif local_smoke > 0.3:
-            spd = Speed.WALK
-        else:
-            spd = Speed.WALK
-
-        return DecisionResult(
-            agent_id=agent.id,
-            target_exit_idx=best_idx,
-            target_exit_pos=exits[best_idx],
-            speed=spd,
-            cooperation=agent.dynamic.cooperation_choice,  # Keep current
-            reasoning=f"[Tactical] exit {best_idx+1}",
-            risk_assessment="low",
-            compute_time=0.0,
-        )
+        return HeuristicPolicy(
+            smoke_block=cls.EXIT_SMOKE_BLOCK
+        ).decide(agent, env, exits, tick=tick)
 
     # ==================================================================
     # Helpers

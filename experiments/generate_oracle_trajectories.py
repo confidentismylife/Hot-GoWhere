@@ -1,13 +1,12 @@
 """Generate Oracle expert trajectories for IRL training.
 
-The Oracle decision function uses fire spread PREDICTION (not just current smoke)
-to choose exits. This creates trajectories that are genuinely better than the naive
-nearest-exit+smoke-penalty heuristic, providing meaningful training data for IRL.
+The Oracle decision function scores exits with a weight configuration
+(safety / efficiency / crowd / fire-distance), producing trajectories with
+distinct preference structures for IRL sensitivity analysis.
 
-Key difference from the heuristic:
-  - Heuristic: score = dist * (1 + smoke_now * 3) — only sees current state
-  - Oracle: predicts smoke at each exit at agent's arrival time, accounts for
-    fire spread rate, balances crowd across exits
+Note: the current implementation uses *current* smoke at each exit, not a
+true arrival-time prediction; treat the Oracle as a synthetic expert used
+to validate the IRL pipeline, not as a fire-dynamics model.
 
 Sensitivity analysis: multiple weight configurations are provided to test whether
 IRL can recover different preference structures. Each config represents a distinct
@@ -29,153 +28,32 @@ import argparse
 import random
 import numpy as np
 from typing import List, Dict, Tuple, Optional
-from dataclasses import dataclass
 from collections import defaultdict
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from decision.agent_state import Agent, AgentProfile, AgentDynamic, Speed, Cooperation
+from decision.policy import (
+    OracleWeights,
+    OraclePolicy,
+    ORACLE_WEIGHT_CONFIGS,
+    ORACLE_WEIGHTS_LEGACY,
+)
 from perception.environment import DisasterSimulator, EnvironmentSnapshot
 from execution.batched_physics import BatchedPhysics
+from execution.agent_factory import random_profile, create_family_groups
 from execution.irl_recovery import TrajectoryCollector
 from group_intel.propagation import GroupIntelligence
 
 
-# ================================================================
-# Oracle weight configurations (sensitivity analysis)
-# ================================================================
-
-@dataclass(frozen=True)
-class OracleWeights:
-    """One set of Oracle scoring weights representing a behavioral strategy.
-
-    Weights are for features: safety, efficiency, crowd_penalty, fire_risk.
-    These are NOT claimed to be ground-truth human preferences — they are
-    synthetic parameterizations used to test whether IRL can recover distinct
-    preference structures from behavioral data alone.
-    """
-    name: str           # identifier for file naming
-    label: str          # human-readable description (Chinese)
-    w_safety: float
-    w_efficiency: float
-    w_crowd: float       # penalty, applied with negative sign
-    w_fire_risk: float   # penalty, applied with negative sign
-
-    @property
-    def description(self) -> str:
-        return (f"{self.label}: safety={self.w_safety:.2f}, "
-                f"efficiency={self.w_efficiency:.2f}, "
-                f"crowd={self.w_crowd:.2f}, fire_risk={self.w_fire_risk:.2f}")
-
-
-# Three configurations spanning the preference space
-ORACLE_WEIGHT_CONFIGS = [
-    OracleWeights("safety_first", "极度惜命型",
-                  w_safety=0.70, w_efficiency=0.10, w_crowd=0.10, w_fire_risk=0.10),
-    OracleWeights("balanced", "均衡型",
-                  w_safety=0.35, w_efficiency=0.35, w_crowd=0.15, w_fire_risk=0.15),
-    OracleWeights("efficiency_first", "追求效率型",
-                  w_safety=0.10, w_efficiency=0.70, w_crowd=0.10, w_fire_risk=0.10),
-]
-
-# Legacy: the original hardcoded weights, kept for reproducibility
-ORACLE_WEIGHTS_LEGACY = OracleWeights(
-    "legacy", "原始设定(0.45/0.25/0.15/0.15)",
-    w_safety=0.45, w_efficiency=0.25, w_crowd=0.15, w_fire_risk=0.15)
-
-
-# ================================================================
-# Oracle decision function
-# ================================================================
-
 def oracle_decide(agent: Agent, env: EnvironmentSnapshot,
                   exits: List[Tuple[float, float]],
                   agent_crowd_map: Dict[int, int],
-                  weights: OracleWeights = None) -> dict:
-    """Make an oracle exit choice using fire spread prediction.
-
-    For each exit, predicts smoke level at the time the agent would arrive,
-    then scores using the provided weight configuration.
-
-    This is strictly better than the heuristic because:
-    1. It accounts for fire spread during travel time (heuristic only sees now)
-    2. It balances crowd across exits (heuristic ignores other agents)
-    3. It considers agent's own speed in travel time calculation
-
-    Args:
-        weights: OracleWeights config. Defaults to ORACLE_WEIGHTS_LEGACY.
-
-    Returns a dict compatible with DecisionResult constructor.
-    """
-    if weights is None:
-        weights = ORACLE_WEIGHTS_LEGACY
-
-    pos = agent.dynamic.position
-    fire_origin = np.array(env.fire_origin, dtype=np.float64)
-
-    best_idx = 0
-    best_score = -float('inf')
-    scores = []
-
-    for i, ex in enumerate(exits):
-        ex_arr = np.array(ex, dtype=np.float64)
-        dist = float(np.linalg.norm(pos - ex_arr))
-
-        # Current smoke at exit (no prediction — differences come from weights alone)
-        smoke_now = float(env.smoke_at(ex_arr))
-        smoke_at_arrival = smoke_now
-
-        # ------ Compute feature scores ------
-
-        # Safety: probability of reaching exit without being incapacitated by smoke
-        safety = max(0.0, 1.0 - smoke_at_arrival)
-
-        # Efficiency: shorter travel is better
-        efficiency = 1.0 / (1.0 + dist / 40.0)
-
-        # Social / crowd balance: penalize exits that many agents are heading to
-        crowd = agent_crowd_map.get(i, 0)
-        max_crowd_per_exit = max(1, sum(agent_crowd_map.values()) / max(1, len(exits)))
-        crowd_ratio = crowd / max(1, max_crowd_per_exit * 2)
-        crowd_penalty = min(0.5, crowd_ratio * 0.5)
-
-        # Fire risk: how close is fire to the exit path
-        fire_dist_to_agent = float(np.linalg.norm(fire_origin - pos))
-        fire_risk = 1.0 / (1.0 + fire_dist_to_agent / 30.0)
-
-        # Combined oracle score using the provided weight configuration
-        score = (safety * weights.w_safety +
-                 efficiency * weights.w_efficiency -
-                 crowd_penalty * weights.w_crowd -
-                 fire_risk * weights.w_fire_risk)
-
-        scores.append((i, score, smoke_at_arrival, dist, safety, efficiency))
-
-        if score > best_score:
-            best_score = score
-            best_idx = i
-
-    # Determine speed based on urgency
-    urgency = 1.0 - best_score  # lower score → more urgent
-    if urgency > 0.7 or smoke_at_arrival > 0.5:
-        spd = Speed.RUN
-    elif urgency > 0.4:
-        spd = Speed.WALK
-    else:
-        spd = Speed.WALK
-
-    return {
-        "target_exit_idx": best_idx,
-        "target_exit_pos": exits[best_idx],
-        "speed": spd,
-        "cooperation": Cooperation.NONE,
-        "reasoning": (f"[Oracle-{weights.name}] exit {best_idx+1}: "
-                      f"safety={scores[best_idx][4]:.2f} "
-                      f"pred_smoke={scores[best_idx][2]:.2f}"),
-        "risk_assessment": "low" if best_score > 0.6 else "moderate",
-        "compute_time": 0.0,
-        "weight_config": weights.name,  # record which config generated this decision
-    }
+                  weights: OracleWeights = None) -> "DecisionResult":
+    """Backward-compatible wrapper around :class:`OraclePolicy`."""
+    return OraclePolicy().decide(
+        agent, env, exits,
+        crowd_map=agent_crowd_map, weights=weights)
 
 
 # ================================================================
@@ -254,6 +132,7 @@ class OracleTrajectoryGenerator:
         self.agent_cfg = agent_cfg
         self._crowd_map: Dict[int, int] = {}
         self._current_weights: OracleWeights = self.weight_configs[0]
+        self._oracle_policy = OraclePolicy()
 
     def generate(self, output_dir: str = "data/trajectories",
                  run_label: str = "",
@@ -300,7 +179,6 @@ class OracleTrajectoryGenerator:
         self._create_family_groups(agents)
 
         # Trajectory collector
-        from decision.cognitive_engine import DecisionResult
         collector = TrajectoryCollector()
 
         total_ticks = int(self.duration / self.dt)
@@ -335,31 +213,29 @@ class OracleTrajectoryGenerator:
                         continue
 
                     # Oracle decision with current weight config
-                    dec = oracle_decide(agent, env_snapshot,
-                                        self.exits, self._crowd_map, weights=w)
-                    d = DecisionResult(
-                        agent_id=agent.id,
-                        target_exit_idx=dec["target_exit_idx"],
-                        target_exit_pos=dec["target_exit_pos"],
-                        speed=dec["speed"],
-                        cooperation=dec["cooperation"],
-                        reasoning=dec["reasoning"],
-                        risk_assessment=dec.get("risk_assessment", "low"),
-                        compute_time=0.0,
-                    )
+                    d = self._oracle_policy.decide(
+                        agent, env_snapshot, self.exits,
+                        crowd_map=self._crowd_map, weights=w, tick=tick)
                     # Apply
                     agent.dynamic.target_exit = np.array(
-                        dec["target_exit_pos"], dtype=np.float64)
-                    agent.dynamic.speed_choice = dec["speed"]
+                        d.target_exit_pos, dtype=np.float64)
+                    agent.dynamic.target_exit_idx = d.target_exit_idx
+                    agent.dynamic.speed_choice = d.speed
                     agent.dynamic.last_decision_tick = tick
                     agent.dynamic.has_new_info = False
-                    agent.dynamic.reasoning_text = dec["reasoning"]
+                    agent.dynamic.reasoning_text = d.reasoning
 
                     # Record trajectory
                     collector.record_decision(agent, d, env_snapshot, False, False)
 
             # 5. Tactical adjustments
             self._tactical_adjust(agents, env_snapshot, tick)
+
+            # 5.1 Group intelligence (fear/stamina/hazard) — matches orchestrator
+            group_intel.propagate(agents, "", self.dt)
+            group_intel.update_fear_levels(agents, env_snapshot, self.dt)
+            group_intel.update_stamina(agents, self.dt)
+            group_intel.update_hazard_damage(agents, env_snapshot, self.dt)
 
             # 6. Physics
             physics.step_all(agents, self.dt)
@@ -450,40 +326,8 @@ class OracleTrajectoryGenerator:
         return agents
 
     def _random_profile(self, idx: int) -> AgentProfile:
-        ac = self.agent_cfg
-        age_roll = random.random()
-        if age_roll < ac.get("age_groups", {}).get("young", {}).get("weight", 0.35):
-            age = random.randint(18, 35)
-        elif age_roll < 0.80:
-            age = random.randint(36, 55)
-        else:
-            age = random.randint(56, 80)
-
-        fam_roll = random.random()
-        if fam_roll < 0.3:
-            familiarity = random.uniform(0.0, 0.3)
-        elif fam_roll < 0.8:
-            familiarity = random.uniform(0.3, 0.7)
-        else:
-            familiarity = random.uniform(0.7, 1.0)
-
-        if age < 35:
-            max_speed = random.uniform(1.2, 2.0)
-        elif age < 55:
-            max_speed = random.uniform(1.0, 1.6)
-        else:
-            max_speed = random.uniform(0.6, 1.2)
-
-        return AgentProfile(
-            age=age, gender=random.choice(["male", "female"]),
-            occupation=random.choice(["office_worker", "student", "shopkeeper",
-                                       "tourist", "security_guard", "retiree"]),
-            familiarity=familiarity, max_speed=max_speed,
-            risk_aversion=random.uniform(0.2, 0.9),
-            altruism=random.uniform(0.1, 0.8),
-            trust_authority=random.uniform(0.3, 0.95),
-            conformity=random.uniform(0.1, 0.9),
-        )
+        """Generate one agent profile from config-driven distributions."""
+        return random_profile(self.agent_cfg)
 
     def _random_dynamic(self, profile: AgentProfile) -> AgentDynamic:
         for _ in range(1000):
@@ -531,18 +375,9 @@ class OracleTrajectoryGenerator:
         )
 
     def _create_family_groups(self, agents: List[Agent]):
-        prob = self.agent_cfg.get("family_group_probability", 0.3)
-        if prob <= 0:
-            return
-        eligible = [a for a in agents if a.profile.age < 60]
-        random.shuffle(eligible)
-        family_count = int(len(eligible) * prob / 2)
-        for _ in range(family_count):
-            if len(eligible) < 2:
-                break
-            a1, a2 = eligible.pop(), eligible.pop()
-            a1.dynamic.family_member_ids.append(a2.id)
-            a2.dynamic.family_member_ids.append(a1.id)
+        new_members = create_family_groups(agents, self.agent_cfg)
+        if new_members:
+            agents.extend(new_members)
 
     def _rebuild_crowd_map(self, agents: List[Agent]):
         self._crowd_map.clear()
@@ -608,6 +443,7 @@ class OracleTrajectoryGenerator:
                     if best_idx is not None:
                         agent.dynamic.target_exit = np.array(
                             self.exits[best_idx], dtype=np.float64)
+                        agent.dynamic.target_exit_idx = best_idx
 
 
 # ================================================================

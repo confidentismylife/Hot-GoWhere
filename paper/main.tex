@@ -1,0 +1,184 @@
+% ============================================================
+% LLM → IRL → RL 人群疏散仿真 — 论文主文件
+%
+% 编译（推荐 latexmk）:
+%   latexmk -xelatex main.tex
+% 或手动:
+%   xelatex main.tex
+%   biber main
+%   xelatex main.tex
+%   xelatex main.tex
+%
+% Overleaf: 菜单 → 编译器选 XeLaTeX；参考文献勾选 Biber。
+%
+% 工作流约定:
+%   references.bib 由 Zotero + Better BibTeX 自动导出维护。
+%   请勿手改该文件；新增/修改文献统一在 Zotero 中进行。
+%   main.tex 只负责 \cite{}，键名与 Zotero 保持一致。
+% ============================================================
+\documentclass[UTF8,zihao=-4]{ctexart}
+
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue]{hyperref}
+\usepackage[backend=biber,style=numeric,sorting=none]{biblatex}
+\addbibresource{references.bib}
+
+% 待办标记：定稿前搜索 [TODO 即可全部清理
+\newcommand{\todo}[1]{\textcolor{red}{\textbf{[TODO: #1]}}}
+
+\title{基于 LLM→IRL→RL 三级联级的人群疏散多智能体仿真}
+\author{\todo{作者姓名}\thanks{\todo{单位、邮箱}}}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+如何将大语言模型（LLM）在人群疏散中表现出的类人决策能力，转化为可解释、可优化的疏散策略，是当前智能体建模面临的关键挑战。本文提出一种基于逆强化学习（IRL）的知识蒸馏方法：首先采集 LLM 智能体在疏散场景中的决策轨迹，使用最大熵 IRL 恢复隐含的多目标奖励权重，再利用该奖励函数训练区域级强化学习（RL）调度策略，并将调度建议以自然语言形式回注 LLM 决策，形成闭环。\todo{补全摘要；引用真实实验数字}
+\end{abstract}
+
+\noindent\textbf{关键词：}大语言模型；逆强化学习；知识蒸馏；人群疏散；智能体建模
+
+\section{引言}
+
+大型公共场所的人群疏散仿真对建筑安全设计和应急预案制定具有重要价值。传统物理模型（如社会力模型 \cite{helbing1995social}）计算高效，但难以刻画个体认知与行为异质性；LLM 智能体 \cite{wu2023sabm} 能产生丰富的类人决策，但其黑盒特性导致决策不可解释、难以形式化优化。
+
+本文回答的问题是：\emph{能否将 LLM 智能体的行为智慧系统性地迁移到一个可解释、可优化的决策系统中？} 我们提出 LLM → IRL → RL 三级联级架构：LLM 生成多样化人类行为数据 → MaxEnt IRL 恢复 5 维价值权重 \cite{ziebart2008maxent} → 分区独立 PPO（Zone-PPO） 区域调度器使用该奖励函数进行出口级调度，并以中文建议回注 LLM Prompt。
+
+\todo{补写：研究动机、与现有方法的定位差异（详见 related_work_draft.md）、贡献列表}
+
+\section{相关工作}
+
+% 本节约自 related_work_draft.md（2026-08-05），为初稿。
+% 所有引用的元数据已通过 arXiv/Crossref 核对；事实性断言在定稿前仍需人工复核。
+
+\subsection{人群疏散仿真：从物理模型到 LLM 智能体}
+
+传统人群疏散仿真以物理模型为主，最具代表性的是社会力模型（social force model, SFM）\cite{helbing1995social}，其将行人运动建模为若干力的叠加，计算高效、便于大规模仿真，但个体决策规则单一，难以刻画年龄、性格、培训背景等异质性导致的行为差异。元胞自动机（cellular automata, CA）方法同样面临“规则即行为”的表达瓶颈。
+
+大语言模型（LLM）的兴起为行为建模提供了新路径。Wu 等人提出 Smart Agent-Based Modeling（SABM）框架，将 LLM 作为智能体的决策核心嵌入传统 ABM，并首次在紧急疏散案例中验证了可行性 \cite{wu2023sabm}。此后，LLM 驱动的疏散仿真迅速成为热点：Dang 等人将 LLM 智能体与 CA 火灾环境结合，赋予智能体个性化记忆、认知与决策能力，模拟火灾疏散中的人类决策与行为 \cite{dang2025llmfire}；Yang 等人将 LLM 作为个体决策核心嵌入 ABM，并在真实灾害疏散案例中验证其真实性、适应性与可靠性 \cite{yang2026think}；Calzolari 等人将 OCEAN 人格特质注入 LLM 智能体，发现人格显著影响个体与群体疏散结果 \cite{calzolari2026personality}；Mendoza 等人提出三层认知层级（高层目标、中层路径推理、底层导航）的人格化智能体框架，并用真实疏散数据进行校准 \cite{mendoza2026hierarchical}。在规模与实用性方面，Li 等人将 LLM 智能体仿真扩展到 13{,}000 个智能体，用于大型集会应急预案制定 \cite{li2025policy}；Sultimov 等人则在野火场景中验证了带记忆的 LLM 调度智能体对疏散协调的有效性 \cite{sultimov2026llmguided}，并进一步构建了耦合自然灾害预测与人类行为的 RESPOND 平台 \cite{sultimov2026respond}。
+
+上述工作证明了“LLM 可以生成多样化、类人的疏散行为”，但普遍停留在“用 LLM 直接驱动行为”这一层：决策过程不可解释、难以形式化优化，且缺少对 LLM 行为真实性的严格验证。Lee 等人用真实移动数据评估 LLM 疏散模拟的可预测性 \cite{lee2025predictability}，Larooij 与 T\"ornberg 的批判性综述更指出，生成式 ABM 普遍缺乏对“可信度”之外的操作性验证 \cite{larooij2025critical}。因此，如何把 LLM 的行为智慧转化为可解释、可优化、可验证的决策系统，成为本领域的关键缺口。
+
+\subsection{从示范行为中学习奖励：IRL 与 LLM}
+
+逆强化学习（IRL）旨在从专家行为中恢复隐含的奖励函数。Ziebart 等人提出的最大熵 IRL（MaxEnt IRL）以“行为分布满足特征匹配约束下的最大熵”为核心假设，是处理多样化人类行为的经典框架 \cite{ziebart2008maxent}。近年来，IRL 与 LLM 的结合出现两条主线。
+
+第一，\emph{用 LLM 改进 IRL 的可解释性与样本效率}。GRACE 用 LLM 驱动进化搜索，从专家轨迹中反演出可执行的代码形式奖励函数 \cite{sapora2025grace}；Masked IRL 利用 LLM 从语言指令推断状态相关性掩码，缓解奖励学习中的伪相关与指令歧义问题 \cite{hwang2026maskedirl}。
+
+第二，\emph{从 LLM/专家行为中恢复稠密奖励并用于下游策略优化}。Scherer 等人通过相干模仿学习（coherent imitation learning）从专家演示中学得稠密奖励，用于提升大规模行为模型策略 \cite{scherer2026csil}；Li 等人证明监督微调（SFT）等价于一种隐式 IRL 奖励恢复，并据此提出 Dense-Path REINFORCE \cite{li2025beyond}；Fanconi 等人提出 R-AIRL，从专家思维链中恢复过程级奖励，用于推理模型的训练与推理期重排 \cite{fanconi2025rairl}；Li 等人进一步从理论上证明标准下一词预测训练的 LLM 内部已蕴含一个等价于离线 IRL 的内生奖励模型 \cite{li2025generalist}。在可解释性方向上，IR$^3$ 用对比 IRL 重构 RLHF 隐式目标并分解为可解释特征 \cite{beigi2026ir3}。
+
+这些工作为本项目提供了方法论依据：从 LLM 生成的示范行为中学习奖励是有理论根基的。但它们大多面向机器人控制、LLM 对齐或通用决策任务，尚未在人群疏散场景中形成“LLM 行为 → IRL 价值权重 → 下游调度策略”的完整链路。
+
+\subsection{LLM 行为蒸馏到下游策略：同赛道方法与本文差异}
+
+与本文最接近的工作可分为三类。\emph{行为蒸馏（BC）类}直接以 LLM 的（状态，动作）样本训练分类器或策略：Zhang 等人提出的 DFD 方法从 LLM 驱动的疏散人群中蒸馏出规则形式的可解释决策函数，并验证其优于经典方法与 LLM 符号回归基线 \cite{zhang2026star}。BC 类方法本质上是对 LLM 行为的表面模仿，难以超越教师策略，且对分布外状态泛化能力有限。\emph{LLM 直接奖励设计类}通过 Prompt 让 LLM 直接陈述对各目标的重视程度作为奖励权重，其依赖“陈述偏好”（stated preference），而心理学研究表明陈述偏好与实际行为中体现的“显示偏好”（revealed preference）存在系统性偏差。\emph{LLM+RL 并联/预测类}中，FLARE 将行为理论、LLM 推理与记忆增强 RL 结合，用于预测真实人群的野火疏散决策 \cite{chen2025flare}；RESPOND 在灾害仿真平台上用 LLM 驱动人群行为 \cite{sultimov2026respond}。这些工作或面向预测而非策略优化，或仍由 LLM 直接承担决策，未形成可解释的策略蒸馏。
+
+\emph{LLM 的安全约束类工作}同样值得关注。Constitutional AI 通过一组显式原则约束 LLM 的自我改进与对齐过程 \cite{bai2022constitutional}；SayCan 用底层技能的价值函数约束 LLM 提出“可行且合语境”的动作 \cite{ahn2022saycan}；KnowNo 基于保形预测对 LLM 规划器的不确定性进行校准，在统计保证下决定“执行还是求助” \cite{ren2023knowno}。与这些训练期或规划期约束不同，本文的安全护栏是推理时的符号化硬约束：LLM 仅作为建议者，7 条可由领域专家验证的物理/生理阈值对每条决策进行实时仲裁，且拦截过程可审计。
+
+表~\ref{tab:related_work_comparison} 从五个维度总结了本文与上述工作的本质区别。
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{本文与同赛道方法的本质区别}
+  \label{tab:related_work_comparison}
+  \begin{tabularx}{\textwidth}{@{}p{2.4cm}XXXX@{}}
+    \toprule
+    维度 & BC 蒸馏（DFD 等） & LLM 直接奖励 & LLM+RL 并联（FLARE 等） & 本文 \\
+    \midrule
+    从 LLM 行为中迁移什么 & 状态→动作映射 & 陈述性权重 & 决策建议/预测信号 & 显示性价值偏好（IRL 恢复） \\
+    理论依据 & 监督学习 & Prompt 自述 & 并行融合 & MaxEnt IRL 特征匹配 \\
+    下游产物 & 黑盒/规则策略 & 人工设计奖励 & 预测模型/决策建议 & 可解释权重 → 区域调度策略 \\
+    闭环 & 无 & 无 & 单向 & RL 建议以自然语言回注 LLM Prompt \\
+    可审计性 & 弱 & 弱 & 中 & 权重可视化 + 护栏审计 \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+综上，据我们所知，现有文献中尚未出现“从 LLM 疏散行为出发，经 MaxEnt IRL 恢复多角色价值权重，再训练区域级 RL 调度策略并以自然语言反馈注入 LLM 决策闭环”的完整方案。本文填补的正是这一缺口；消融实验与同赛道基线对比（BC 蒸馏、LLM 直接奖励、启发式 RL）进一步论证了 IRL 作为蒸馏桥梁的必要性。
+
+\section{方法：LLM → IRL → RL 三级联级}
+
+\subsection{系统总览}
+
+系统由三层构成：感知层将灾害环境（CA 仿真网格）与可选视觉/检测通道转换为中文场景描述；决策层由 vLLM 批量推理引擎驱动多角色智能体并受安全护栏约束；执行层负责批量社会力物理引擎、IRL 轨迹采集与权重恢复、分区独立 PPO（Zone-PPO） 区域调度。
+
+\begin{figure}[t]
+  \centering
+  \fbox{\parbox[c][6cm][c]{0.9\textwidth}{\centering 架构示意图占位\\（LLM → IRL → RL 三级联级）}}
+  \caption{系统总体架构。\todo{替换为正式矢量图（建议 TikZ 或导出 PDF）}}
+  \label{fig:architecture}
+\end{figure}
+
+\subsection{感知与决策}
+
+每个智能体根据角色（平民/店员/引导员/消防员/指挥官）使用对应的 Prompt 模板，结合 RAG 知识库与场景描述输出结构化决策 \todo{补充 Prompt 结构与决策字段}。安全护栏在推理时对 7 条物理/生理阈值进行仲裁，拦截记录可审计，实测拦截率与伤亡率变化待补。
+
+\subsection{MaxEnt IRL 价值权重恢复}
+
+将 5 维奖励特征 $\phi(s) = [\phi_{\text{safety}}, \phi_{\text{efficiency}}, \phi_{\text{social}}, \phi_{\text{conformity}}, \phi_{\text{comfort}}]$ 离散化后，在特征匹配约束下最大化策略熵：
+\begin{equation}
+  \max_{w} \; \mathcal{H}(\pi_w)
+  \quad \text{s.t.} \quad
+  \mathbb{E}_{\pi_w}[\phi] = \mathbb{E}_{\pi_E}[\phi],
+\end{equation}
+其中 $\pi_E$ 为 LLM 专家策略。跨人设引入组约束正则化 $\lambda_{\text{group}} \sum_{i,j}\lVert w^{(i)} - w^{(j)}\rVert^2$ 以共享统计强度。
+
+\subsection{分区独立 PPO（Zone-PPO） 区域调度与自然语言反馈}
+
+将商场划分为 4 个区域，每个区域一个双头 MLP 调度器（策略头输出各出口偏好分数 $[-1,+1]$，价值头估计状态值），以 IRL 恢复的权重构造奖励，使用 PPO + GAE 离线训练。推理时调度建议转为中文文本注入 LLM Prompt，LLM 保留最终决策权。
+
+\section{实验}
+
+\subsection{实验设置}
+
+\todo{补全场景参数：商场尺寸、出口数、智能体数、时长、随机种子数}
+
+\begin{table}[t]
+  \centering
+  \caption{主实验条件与指标（\todo{数字需与 data/experiments 核对}）}
+  \label{tab:conditions}
+  \begin{tabular}{lcccc}
+    \toprule
+    条件 & 疏散率 (\%) & 伤亡率 (\%) & 平均疏散时间 (s) & 决策质量 \\
+    \midrule
+    SFM           & \todo{} & \todo{} & \todo{} & --- \\
+    Pure RL       & \todo{} & \todo{} & \todo{} & --- \\
+    Pure LLM      & \todo{} & \todo{} & \todo{} & --- \\
+    BC 蒸馏 → RL  & \todo{} & \todo{} & \todo{} & --- \\
+    LLM 直接奖励  & \todo{} & \todo{} & \todo{} & --- \\
+    \textbf{Ours} & \todo{} & \todo{} & \todo{} & \todo{} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{主实验结果}
+
+\todo{写入 7 组条件的配对 t 检验、Cohen's d、Bootstrap 95\% CI；注明实验模式（真实 LLM / 合成管线）}
+
+\section{消融与讨论}
+
+\todo{补写：逐通道消融（RL 建议/VLM/YOLO/RAG）、GC-MaxEnt vs 标准 MaxEnt、区域化 vs 全局调度、超参数敏感性}
+
+\section{结论与展望}
+
+\todo{总结三级联级的有效性、局限（真实数据验证、规模、泛化）与未来工作}
+
+\appendix
+\section{RL 调度建议注入示例}
+
+\begin{verbatim}
+【西北区调度中心建议】
+  ✅ 强烈推荐 出口3、建议考虑 出口1
+  ⚠️ 避免前往 出口2（严重拥堵或危险）
+\end{verbatim}
+
+\printbibliography[heading=bibintoc]
+
+\end{document}

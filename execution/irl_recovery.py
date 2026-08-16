@@ -29,6 +29,8 @@ from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, field
 from collections import defaultdict
 
+from execution.features import FEATURE_NAMES, extract_trajectory_features
+
 
 # ================================================================
 # Data structures
@@ -99,7 +101,8 @@ class TrajectoryCollector:
         return persona
 
     def record_decision(self, agent, decision, env_snapshot,
-                        was_blocked: bool, was_modified: bool):
+                        was_blocked: bool = False, was_modified: bool = False,
+                        source: str = None):
         """Record one LLM decision during simulation."""
         aid = agent.id
 
@@ -124,9 +127,10 @@ class TrajectoryCollector:
         nearest_exit = self._nearest_exit_info(pos, env_snapshot)
 
         traj.decisions.append({
-            "tick": getattr(decision, 'tick', 0),
+            "tick": int(getattr(decision, 'tick', env_snapshot.tick)),
             "sim_time": env_snapshot.timestamp,
             "position": [float(pos[0]), float(pos[1])],
+            "source": source or getattr(decision, 'source', 'unknown'),
             "smoke_at_pos": smoke_at_pos,
             "fire_distance": fire_dist,
             "nearest_exit_idx": nearest_exit[0],
@@ -151,9 +155,11 @@ class TrajectoryCollector:
                 d = a.dynamic
                 if d.evacuated:
                     self._trajectories[aid].outcome = "evacuated"
-                    self._trajectories[aid].evacuation_time = (
-                        d.last_decision_tick * dt if d.last_decision_tick > 0 else -1
-                    )
+                    evac_time = getattr(d, 'evacuation_time', -1.0)
+                    if evac_time < 0:
+                        evac_time = (d.last_decision_tick * dt
+                                     if d.last_decision_tick > 0 else -1)
+                    self._trajectories[aid].evacuation_time = evac_time
                 elif not d.alive:
                     self._trajectories[aid].outcome = "dead"
                 else:
@@ -239,15 +245,6 @@ class TrajectoryCollector:
 # ================================================================
 # IRL Recovery — Maximum Entropy IRL
 # ================================================================
-
-# Five reward features that define "good" evacuation behavior
-FEATURE_NAMES = [
-    "safety",       # Staying away from fire/smoke
-    "efficiency",   # Moving toward nearest usable exit quickly
-    "social",       # Helping others, staying with family
-    "conformity",   # Following crowd / authority
-    "comfort",      # Taking familiar routes, avoiding exertion
-]
 
 # Persona categories
 PERSONA_CATEGORIES = [
@@ -662,36 +659,8 @@ class IRLRecovery:
     def _extract_trajectory_features(self, traj: AgentTrajectory
                                      ) -> List[List[float]]:
         """Extract normalized feature vectors from a single trajectory."""
-        features = []
-        for dec in traj.decisions:
-            smoke = dec.get("smoke_at_pos", 0)
-            fire_dist = dec.get("fire_distance", 200)
-            safety = (1.0 - smoke) * min(fire_dist / 50.0, 1.0)
-
-            nearest_dist = max(dec.get("nearest_exit_dist", 30), 1)
-            speed_str = str(dec.get("speed", "walk"))
-            speed_val = 1.0 if "run" in speed_str else (
-                0.5 if "walk" in speed_str else 0.2)
-            efficiency = (1.0 / (1.0 + nearest_dist / 50.0)) * speed_val
-
-            coop = str(dec.get("cooperation", "none"))
-            if "help_family" in coop or "lead_others" in coop:
-                social = 1.0
-            elif "follow_crowd" in coop:
-                social = 0.5
-            else:
-                social = 0.1
-
-            conformity = 1.0 if "follow_crowd" in coop else (
-                0.3 if "none" in coop else 0.5)
-
-            fear = float(dec.get("fear", 0)) / 10.0
-            speed_comfort = 1.0 if "walk" in speed_str else (
-                0.8 if "crawl" in speed_str else 0.3)
-            comfort = (1.0 - fear) * speed_comfort
-
-            features.append([safety, efficiency, social, conformity, comfort])
-        return features
+        # Single source of truth: execution.features
+        return extract_trajectory_features(traj)
 
     # ================================================================
     # Persistence

@@ -76,8 +76,9 @@ def test_orchestrator_multi_role_spawn():
         r = a.profile.role
         roles[r] = roles.get(r, 0) + 1
 
-    assert roles.get("civilian", 0) == 50, \
-        f"Expected 50 civilians, got {roles.get('civilian', 0)}"
+    assert roles.get("civilian", 0) >= 50, \
+        f"Expected at least 50 civilians (family dependents may be added), " \
+        f"got {roles.get('civilian', 0)}"
     assert roles.get("global_commander", 0) >= 1, \
         f"Expected at least 1 global commander"
     assert roles.get("area_commander", 0) >= 1, \
@@ -252,7 +253,7 @@ def test_full_simulation_mini():
         orch.sim_time += orch.dt
         tick_times.append((time.perf_counter() - t0) * 1000)
 
-    remaining = orch.num_agents - orch.evacuated_count - orch.casualty_count
+    remaining = len(orch.agents) - orch.evacuated_count - orch.casualty_count
     assert remaining >= 0, f"Agent count should be non-negative, got {remaining}"
     assert len(tick_times) == total_ticks
 

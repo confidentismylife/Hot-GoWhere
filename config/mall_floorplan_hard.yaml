@@ -1,0 +1,119 @@
+# 武汉保利广场 1F — 极端灾害场景 (Hard Mode)
+#
+# 200m × 120m, 多翼结构, 中央中庭, 6 exits (2个被封锁)
+# 双火源: 中庭中心 + 西北影院区
+# 设计目标: 让"走最近出口"的启发式策略失效，
+#           迫使 LLM 进行全局态势推理和预测性决策
+#
+# Usage:
+#   python -m experiments.paper_experiment --config config/mall_floorplan_hard.yaml --n_runs 30 --agents 300 --duration 360
+
+simulation:
+  num_agents: 400              # 高密度 → 真实拥堵
+  duration: 360                 # 6 分钟
+  dt: 0.1
+  decision_interval: 5.0           # 更频繁的决策 (火势变化快)
+  seed: 42
+
+environment:
+  type: "mall"
+  floorplan: "wuhan_baoli_1f"
+  width: 200.0
+  height: 120.0
+  disaster: "fire"
+  # 双火源: 中庭中心 (切断商场) + 东南餐饮区
+  disaster_origin: [100.0, 60.0]   # 主火源: 中庭中心 — 最致命位置，瞬间切断四条回廊
+  # 双火源（真实实现: 两个点都会起火）: 中庭中心 + 西北影院区
+  fire_sources:
+    - [100.0, 60.0]
+    - [55.0, 92.0]
+  disaster_spread_rate: 0.25       # 极快蔓延 (正常 0.05-0.10)
+
+  # 6 个出口中封锁 2 个，制造瓶颈
+  exit_positions:
+    - [55.0, 2.0]     # 北1 — 主入口 (可用)
+    - [145.0, 2.0]    # 北2 — 次入口 (可用)
+    - [2.0, 45.0]     # 西1 — 消防楼梯 (可用)
+    # - [2.0, 85.0]   # 西2 — 影院出口 (封锁: 西北火源)
+    # - [198.0, 60.0] # 东1 — 餐厅出口 (封锁: 紧邻火源)
+    - [100.0, 118.0]  # 南 — 正门入口 (可用)
+
+  # 额外障碍: 中庭火源附近的临时危险区
+  obstacles:
+    - {center: [100.0, 60.0], radius: 12.0, label: "中庭火场-禁止通行"}
+    - {center: [55.0, 92.0], radius: 8.0, label: "西北火场-禁止通行"}
+
+llm:
+  enabled: true                 # Set false (or use --no-llm) for heuristic-only runs
+  model: "Qwen/Qwen2.5-7B-Instruct-AWQ"
+  quantization: "awq"
+  max_model_len: 4096
+  gpu_memory_utilization: 0.75
+  temperature: 0.3
+  fixed_seed: true                  # LLM 采样 seed = 仿真 seed
+  max_tokens: 256
+  batch_size: 32
+  lora_path: ""
+
+knowledge_base:
+  persist_dir: "./data/disaster_kb"
+  embedding_model: "BAAI/bge-small-zh-v1.5"
+
+agents:
+  age_groups:
+    young:    {min: 18, max: 35, weight: 0.40}
+    middle:   {min: 36, max: 55, weight: 0.40}
+    elderly:  {min: 56, max: 80, weight: 0.15}
+    child:    {min: 5,  max: 17, weight: 0.05}
+  familiarity_distribution:
+    low:     {range: [0.0, 0.3], weight: 0.5}     # 更多不熟悉环境的访客
+    medium:  {range: [0.3, 0.7], weight: 0.4}
+    high:    {range: [0.7, 1.0], weight: 0.1}     # 更少员工
+  family_group_probability: 0.35
+  max_speed_range: [0.8, 2.0]
+
+visualization:
+  enabled: true
+  width: 1400
+  height: 840
+
+vlm:
+  enabled: false
+  model: "Qwen/Qwen2.5-VL-7B-Instruct-AWQ"
+  call_interval: 30
+
+yolo:
+  model: "yolov8n.pt"
+  conf_threshold: 0.35
+  call_interval: 10
+
+diffusion:
+  enabled: false
+  d_model: 256
+  nhead: 8
+  num_layers: 6
+  num_inference_steps: 100
+  checkpoint: "./checkpoints/diffusion_final.pt"
+
+# ================================================================
+# LLM → IRL → RL Three-Tier Cascade Architecture
+# ================================================================
+irl:
+  enabled: false
+  output_dir: "data/trajectories"
+  min_trajectories_per_persona: 10
+  learning_rate: 0.01
+  max_iter: 500
+
+rl_scheduling:
+  enabled: false
+  pretrained_weights: ""
+  irl_weights: "data/irl_weights.json"
+  rl_inference_interval: 1
+
+# 4 象限 zones (200m×120m)
+zones:
+  - {id: 0, name: "西北区", x_min: 0,   x_max: 100, y_min: 60, y_max: 120, primary_exits: [0,2], description: "商场西北，受中庭和西北双火源夹击"}
+  - {id: 1, name: "东北区", x_min: 100, x_max: 200, y_min: 60, y_max: 120, primary_exits: [1,4], description: "商场东北，中庭火源阻断南向通道"}
+  - {id: 2, name: "西南区", x_min: 0,   x_max: 100, y_min: 0,  y_max: 60,  primary_exits: [2,3,5], description: "商场西南，相对安全的回撤区"}
+  - {id: 3, name: "东南区", x_min: 100, x_max: 200, y_min: 0,  y_max: 60,  primary_exits: [4,5], description: "商场东南，受中庭和东南双火源威胁"}

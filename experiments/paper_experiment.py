@@ -48,7 +48,8 @@ def mann_whitney_p(a: np.ndarray, b: np.ndarray) -> float:
         while j < len(combined) and combined[order][j] == combined[order][i]:
             j += 1
         if j - i > 1:
-            mean_rank = np.mean(np.arange(i + 1, j + 2, dtype=np.float64))
+            # Tied values occupy ranks [i+1, j]; assign their mean.
+            mean_rank = np.mean(np.arange(i + 1, j + 1, dtype=np.float64))
             for k in range(i, j):
                 ranks[order][k] = mean_rank
         i = j

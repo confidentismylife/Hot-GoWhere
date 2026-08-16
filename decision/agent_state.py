@@ -72,6 +72,9 @@ class AgentDynamic:
 
     # --- Current Decision ---
     target_exit: Optional[np.ndarray] = None
+    target_exit_idx: Optional[int] = None   # Index into env.exits, kept in sync with target_exit
+    evacuation_time: float = -1.0           # Sim seconds when evacuated; -1 = not evacuated
+    evacuation_tick: int = -1               # Tick when evacuated; -1 = not evacuated
     speed_choice: Speed = Speed.WALK
     cooperation_choice: Cooperation = Cooperation.NONE
     reasoning_text: str = ""

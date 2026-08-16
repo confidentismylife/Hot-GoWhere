@@ -12,6 +12,14 @@ from typing import List
 
 class GroupIntelligence:
 
+    # Hazard damage probabilities (per second of exposure). Conservative
+    # defaults; calibrate against scenario stress tests before publication.
+    FIRE_DEATH_PROB_PER_S = 0.05
+    SMOKE_LETHAL_THRESHOLD = 0.75
+    SMOKE_LEATHAL_DEATH_PROB_PER_S = 0.02
+    SMOKE_INJURY_PROB_PER_S = 0.002
+    HEAT_DEATH_PROB_PER_S = 0.02
+
     def __init__(self, width: float, height: float):
         self.width = width
         self.height = height
@@ -124,6 +132,42 @@ class GroupIntelligence:
 
             d.stamina = max(0.0, min(100.0, d.stamina))
             if d.stamina <= 0 and random.random() < 0.01 * dt:
+                d.alive = False
+
+    def update_hazard_damage(self, agents: List, env_snapshot, dt: float):
+        """Apply injury/death from fire, lethal smoke, and heat.
+
+        Previously fire/smoke/temperature never harmed agents directly: the
+        only death path was random stamina-exhaustion, which made the
+        casualty metric physically meaningless. Probabilities below are
+        deliberately conservative per tick:
+          - standing in fire: injured immediately, ~5%/s fatality
+          - smoke > 0.85: ~1%/s fatality
+          - smoke > 0.6: small injury chance
+          - temperature > 300°C: ~2%/s fatality
+        """
+        for agent in agents:
+            if not agent.dynamic.alive or agent.dynamic.evacuated:
+                continue
+            d = agent.dynamic
+            pos = agent.position
+
+            if env_snapshot.is_on_fire(pos):
+                d.injured = True
+                if random.random() < self.FIRE_DEATH_PROB_PER_S * dt:
+                    d.alive = False
+                    continue
+
+            smoke = float(env_snapshot.smoke_at(pos))
+            if smoke > self.SMOKE_LETHAL_THRESHOLD and \
+                    random.random() < self.SMOKE_LEATHAL_DEATH_PROB_PER_S * dt:
+                d.alive = False
+                continue
+            if smoke > 0.6 and random.random() < self.SMOKE_INJURY_PROB_PER_S * dt:
+                d.injured = True
+
+            temp = float(env_snapshot.temperature_at(pos))
+            if temp > 300.0 and random.random() < self.HEAT_DEATH_PROB_PER_S * dt:
                 d.alive = False
 
     # ================================================================

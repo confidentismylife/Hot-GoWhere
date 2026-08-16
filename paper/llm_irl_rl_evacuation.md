@@ -81,6 +81,11 @@ $$\max_{w} \mathcal{H}(\pi_w) \quad \text{s.t.} \quad \mathbb{E}_{\pi_w}[\phi] =
 
 RL输出以自然语言文本注入LLM Prompt（"强烈推荐出口1，建议考虑出口2"），保留LLM最终决策权。
 
+> 实现说明：当前实现为 MAPPO 风格的 CTDE —— 各分区独立策略头（分散执行）+
+> 共享集中式价值网络（仅训练时使用）；联合策略为因子化高斯策略。
+> 训练时动作由策略网络自身采样（on-policy），快速规则模拟器仅用于加速
+> 环境推演。早期稿中的“P-MAPPO”统一更名为“分区独立 PPO（Zone-PPO）”。
+
 ### 2.5 对比方法
 
 本文实现了两条**同赛道蒸馏基线**，用于直接验证"IRL是否比更简单的蒸馏方案更好"：
@@ -287,7 +292,7 @@ IRL则是观察LLM在100个真实决策中的行为，反推出"实际上你在�
 |------|------|------|------|
 | 仿真编排器 | `execution/orchestrator.py` | 1120 | 主仿真循环，多角色Agent生命周期 |
 | IRL轨迹恢复 | `execution/irl_recovery.py` | 761 | 轨迹采集+MaxEnt/GC-MaxEnt IRL |
-| RL调度器 | `execution/rl_scheduler.py` | 1172 | P-MAPPO区域调度+快速训练模拟器 |
+| RL调度器 | `execution/rl_scheduler.py` | 1172 | 分区独立 PPO（Zone-PPO）区域调度+快速训练模拟器 |
 | BC蒸馏基线 | `experiments/bc_baseline.py` | 280 | 行为克隆+LLM直接奖励对比 |
 | 细粒度消融 | `experiments/deep_ablation.py` | 430 | 通道消融+正则化+区域vs全局+敏感性 |
 | 极端场景测试 | `experiments/stress_tests.py` | 340 | 26个极端场景鲁棒性测试 |

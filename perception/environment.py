@@ -31,6 +31,7 @@ class EnvironmentSnapshot:
 
     # Strategic context for LLM reasoning (v2.2)
     fire_origin: Tuple[float, float] = (0.0, 0.0)
+    fire_origins: List[Tuple[float, float]] = field(default_factory=list)
     spread_rate: float = 0.05
     exit_crowd_counts: List[int] = field(default_factory=list)
 
@@ -75,14 +76,19 @@ class DisasterSimulator:
 
     def __init__(self, width: float, height: float,
                  disaster_type: str,
-                 origin: Tuple[float, float],
+                 origin,  # Tuple[float,float] or List[Tuple[float,float]]
                  spread_rate: float,
                  resolution: float = 0.5,
                  wall_mask: np.ndarray = None):
         self.width = width
         self.height = height
         self.disaster_type = disaster_type
-        self.origin = np.array(origin, dtype=np.float32)
+        if (isinstance(origin, (list, tuple)) and len(origin) > 0
+                and isinstance(origin[0], (list, tuple, np.ndarray))):
+            self.origins = [np.array(o, dtype=np.float32) for o in origin]
+        else:
+            self.origins = [np.array(origin, dtype=np.float32)]
+        self.origin = self.origins[0]  # Backward-compatible primary origin
         self.spread_rate = spread_rate
         self.resolution = resolution
 
@@ -104,10 +110,11 @@ class DisasterSimulator:
         else:
             self.wall_mask = np.zeros((self.rows, self.cols), dtype=bool)
 
-        # Initialize disaster origin
-        or_r, or_c = self._world_to_grid(self.origin)
-        if not self.wall_mask[or_r, or_c]:
-            self._ignite_cell(or_r, or_c, intensity=1.0)
+        # Initialize disaster origin(s) — multi-source support
+        for origin_pt in self.origins:
+            or_r, or_c = self._world_to_grid(origin_pt)
+            if not self.wall_mask[or_r, or_c]:
+                self._ignite_cell(or_r, or_c, intensity=1.0)
 
         # Pre-compute Gaussian kernel for fire spread
         self.kernel = self._make_kernel(sigma=1.5)
@@ -258,6 +265,7 @@ class DisasterSimulator:
             official_broadcast=official_broadcast,
             disaster_type=self.disaster_type,
             fire_origin=(float(self.origin[0]), float(self.origin[1])),
+            fire_origins=[(float(o[0]), float(o[1])) for o in self.origins],
             spread_rate=self.spread_rate,
             exit_crowd_counts=(exit_crowd_counts if exit_crowd_counts is not None
                                else [0] * n_exits),

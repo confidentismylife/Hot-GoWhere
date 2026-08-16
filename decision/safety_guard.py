@@ -44,6 +44,16 @@ class SafetyGuard:
     # ------------------------------------------------------------------
     # Hard constraint thresholds
     # ------------------------------------------------------------------
+    RULE_NAMES = [
+        "exit_smoke_swap",   # target exit smoke > 0.6 -> switched
+        "fire_path_swap",    # path to exit crosses fire -> switched
+        "stamina_speed",     # RUN with low stamina -> slowed
+        "injured_speed",     # injured agent tried to RUN -> slowed
+        "agent_on_fire",     # standing on fire, not RUN -> forced RUN
+        "distance_sanity",   # exit farther than 150m -> switched
+        "wait_on_hazard",    # WAIT in smoke/heat -> forced WALK
+    ]
+
     EXIT_SMOKE_BLOCK = 0.6       # Exit blocked if smoke > this
     EXIT_SMOKE_WARN = 0.3        # Warn if smoke > this
     STAMINA_RUN_MIN = 20.0       # Must have >= this to run
@@ -57,6 +67,13 @@ class SafetyGuard:
         "crawl": 0.01,
         "wait": 0.0,
     }
+
+    def __init__(self):
+        self.counters = {name: 0 for name in self.RULE_NAMES}
+
+    def reset_counters(self):
+        """Clear per-rule counters (useful when reusing one guard)."""
+        self.counters = {name: 0 for name in self.RULE_NAMES}
 
     # ------------------------------------------------------------------
     # Public API
@@ -155,6 +172,7 @@ class SafetyGuard:
                 )
                 result.final_exit_idx = best_idx
                 result.modified = True
+                self.counters["exit_smoke_swap"] += 1
 
         elif smoke > self.EXIT_SMOKE_WARN:
             result.warnings.append(
@@ -186,6 +204,7 @@ class SafetyGuard:
                     )
                     result.final_exit_idx = best_idx
                     result.modified = True
+                    self.counters["fire_path_swap"] += 1
                 else:
                     result.passed = False
                     result.block_reason = "路径经过火源且无替代出口"
@@ -204,6 +223,7 @@ class SafetyGuard:
                 result.final_speed = Speed.WALK.value
                 result.warnings.append(f"体力仅{stamina:.0f}, run→walk")
             result.modified = True
+            self.counters["stamina_speed"] += 1
 
     def _check_injured_speed(self, decision, agent: Agent, result: SafetyResult):
         """Injured agents cannot run."""
@@ -211,6 +231,7 @@ class SafetyGuard:
             result.final_speed = Speed.WALK.value
             result.warnings.append("受伤状态禁止奔跑, run→walk")
             result.modified = True
+            self.counters["injured_speed"] += 1
 
     def _check_agent_on_fire(self, decision, agent: Agent,
                              env: EnvironmentSnapshot, result: SafetyResult):
@@ -221,6 +242,7 @@ class SafetyGuard:
                 result.final_speed = Speed.RUN.value
                 result.warnings.append(f"所在位置已着火, {current_speed}→run")
                 result.modified = True
+                self.counters["agent_on_fire"] += 1
 
     def _check_distance_sanity(self, decision, agent: Agent,
                                env: EnvironmentSnapshot, result: SafetyResult):
@@ -236,6 +258,7 @@ class SafetyGuard:
             )
             result.final_exit_idx = best_idx
             result.modified = True
+            self.counters["distance_sanity"] += 1
 
     def _check_wait_on_hazard(self, decision, agent: Agent,
                                env: EnvironmentSnapshot, result: SafetyResult):
@@ -256,6 +279,7 @@ class SafetyGuard:
                 f"当前位置烟雾{smoke:.0%}/温度{temp:.0f}°C, 不应原地等待"
             )
             result.modified = True
+            self.counters["wait_on_hazard"] += 1
 
     # ------------------------------------------------------------------
     # Helpers

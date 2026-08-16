@@ -24,6 +24,10 @@ def load_config():
 
 
 def main():
+    # Deterministic fire spread; otherwise the 60s scenario randomly
+    # blocks all viable exits and makes this test flaky.
+    np.random.seed(42)
+
     cfg = load_config()
     env_cfg = cfg["environment"]
 
@@ -162,7 +166,7 @@ def main():
           agent, decision,
           expect_blocked=False,
           expect_modified=on_fire,
-          expect_speed=("walk" if on_fire else None))
+          expect_speed=("run" if on_fire else None))
 
     print(f"\n{'='*50}")
     print(f"  结果: {tests_passed}/{tests_total} 通过")

@@ -1,0 +1,107 @@
+# 武汉保利广场 1F — 极限火灾场景 (Extreme / Heuristic baseline)
+#
+# 200m × 120m, 6 exits
+# 双真火源: 东侧餐饮区 + 南侧出口内侧
+# 设计目标: 让最近的出口在仿真中段 (~100~200s) 陆续被烟雾封锁，
+#           制造“近出口突然失效”的决策分叉点，区分启发式与 LLM/RL 策略。
+#
+# Usage:
+#   python -m experiments.compare_rl_heuristic \
+#       --rl-config config/mall_floorplan_rl_extreme.yaml \
+#       --heuristic-config config/mall_floorplan_extreme.yaml \
+#       --agents 200 --duration 360 --seeds 42 43 44 45 46 \
+#       --output results/compare_rl_extreme_5seeds
+
+simulation:
+  num_agents: 200              # 比 82 更高密度 → 出口分流/拥堵更有意义
+  duration: 360
+  dt: 0.1
+  decision_interval: 10.0
+  seed: 42
+
+environment:
+  type: "mall"
+  floorplan: "wuhan_baoli_1f"
+  width: 200.0
+  height: 120.0
+  disaster: "fire"
+  disaster_origin: [165.0, 55.0]   # 主火源: 东侧餐饮区（威胁 E5 东出口）
+  fire_sources:                    # 双真火源
+    - [165.0, 55.0]
+    - [85.0, 105.0]                # 南侧出口内侧（威胁 E6 南出口）
+  disaster_spread_rate: 0.22       # 快速蔓延: 出口约 100~180s 开始被烟雾封锁
+  obstacles:
+    - {center: [165.0, 55.0], radius: 6.0, label: "东侧火场-危险区"}
+    - {center: [85.0, 105.0], radius: 6.0, label: "南侧火场-危险区"}
+
+llm:
+  enabled: true
+  model: "Qwen/Qwen2.5-7B-Instruct-AWQ"
+  quantization: "awq"
+  max_model_len: 4096
+  gpu_memory_utilization: 0.75
+  temperature: 0.3
+  fixed_seed: true                  # LLM 采样 seed = 仿真 seed（A/B 可控）
+  max_tokens: 256
+  batch_size: 32
+  lora_path: ""
+
+knowledge_base:
+  persist_dir: "./data/disaster_kb"
+  embedding_model: "BAAI/bge-small-zh-v1.5"
+
+agents:
+  age_groups:
+    young:    {min: 18, max: 35, weight: 0.40}
+    middle:   {min: 36, max: 55, weight: 0.40}
+    elderly:  {min: 56, max: 80, weight: 0.15}
+    child:    {min: 5,  max: 17, weight: 0.05}
+  familiarity_distribution:
+    low:     {range: [0.0, 0.3], weight: 0.4}
+    medium:  {range: [0.3, 0.7], weight: 0.4}
+    high:    {range: [0.7, 1.0], weight: 0.2}
+  family_group_probability: 0.35
+  max_speed_range: [0.8, 2.0]
+
+visualization:
+  enabled: true
+  width: 1400
+  height: 840
+
+vlm:
+  enabled: false
+  model: "Qwen/Qwen2.5-VL-7B-Instruct-AWQ"
+  call_interval: 30
+
+yolo:
+  model: "yolov8n.pt"
+  conf_threshold: 0.35
+  call_interval: 10
+
+diffusion:
+  enabled: false
+  d_model: 256
+  nhead: 8
+  num_layers: 6
+  num_inference_steps: 100
+  checkpoint: "./checkpoints/diffusion_final.pt"
+
+irl:
+  enabled: false
+  output_dir: "data/trajectories"
+  min_trajectories_per_persona: 10
+  learning_rate: 0.01
+  max_iter: 500
+
+rl_scheduling:
+  enabled: false
+  pretrained_weights: ""
+  irl_weights: "data/irl_weights.json"
+  rl_inference_interval: 1
+  smoke_block_threshold: 0.6
+
+zones:
+  - {id: 0, name: "西北区", x_min: 0,   x_max: 100, y_min: 60, y_max: 120, primary_exits: [0,2,3], description: "商场西北区域"}
+  - {id: 1, name: "东北区", x_min: 100, x_max: 200, y_min: 60, y_max: 120, primary_exits: [1,4], description: "商场东北区域"}
+  - {id: 2, name: "西南区", x_min: 0,   x_max: 100, y_min: 0,  y_max: 60,  primary_exits: [2,3,5], description: "商场西南区域"}
+  - {id: 3, name: "东南区", x_min: 100, x_max: 200, y_min: 0,  y_max: 60,  primary_exits: [4,5], description: "商场东南区域（含东侧火源）"}

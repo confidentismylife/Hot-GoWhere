@@ -4,6 +4,7 @@ __pycache__/
 .vllm/
 data/
 frames/
+results/
 *.mp4
 *.gif
 .DS_Store

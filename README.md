@@ -40,7 +40,7 @@
 | 建模层 | LLM能否模拟多样化人类疏散行为？ | 5角色×5人设的600 Agent体系，LLM生成有人类心理特征的决策 |
 | 安全层 | LLM决策在安全关键场景中是否可靠？ | 7条硬约束安全护栏，LLM是"建议者"、护栏是"仲裁者" |
 | **价值层** | **能否从LLM行为中学习人类的隐式价值偏好？** | **MaxEnt IRL从12万条轨迹中恢复5维奖励权重** |
-| **调度层** | **学到的价值偏好能否指导全局最优调度？** | **P-MAPPO多智能体RL使用IRL权重进行区域级出口调度** |
+| **调度层** | **学到的价值偏好能否指导全局最优调度？** | **分区独立 PPO（Zone-PPO）多智能体RL使用IRL权重进行区域级出口调度** |
 | 工程层 | 单卡消费级GPU能否支撑全链路？ | AWQ量化 + vLLM Prefix Caching + 异步流水线，800 Agent在RTX 4090上120ms/tick |
 
 **核心算法贡献**：LLM → IRL → RL 三级联级架构，实现了从"人类行为数据"到"价值偏好"再到"调度策略"的完整知识迁移链。
@@ -77,12 +77,17 @@ LLM行为数据 ──IRL──→ 人类价值权重 ──注入RL──→ �
 - 5种人设：未培训老人、未培训年轻人、已培训店员、引导员、消防员
 - 输出：每种人设的5维权重向量，如消防员 `w=[0.20, 0.10, 0.50, 0.05, 0.15]`——社交权重最高
 
-**第三级：P-MAPPO区域调度**
+**第三级：分区独立 PPO（Zone-PPO）区域调度**
 - 将150m×80m商场划分为4个象限区域(NW/NE/SW/SE)
-- 每个区域一个P-MAPPO调度Agent (3层MLP, 观测→隐藏→出口偏好[-1,+1])
+- 每个区域一个分区独立 PPO（Zone-PPO）调度Agent (3层MLP, 观测→隐藏→出口偏好[-1,+1])
 - RL的奖励函数使用IRL恢复的人类价值权重——不是人工设计，是从LLM行为中学来的
 - RL输出转为中文自然语言建议，注入LLM Prompt：`【西北区调度中心建议】✅ 强烈推荐 出口3 ⚠️ 避免前往 出口2`
 - LLM仍做最终决策——RL只是"建议"，不替代LLM的人类判断力
+
+> 实现说明：当前实现为 MAPPO 风格的 CTDE —— 各分区独立策略头（分散执行）+
+> 共享集中式价值网络（仅训练时使用）；联合策略为因子化高斯策略
+> （联合 log-prob 为各分区之和），并非完整联合动作模型。
+> 早期文档中的“P-MAPPO”统一为“分区独立 PPO（Zone-PPO）”。
 
 ### 2.3 技术细节
 
@@ -148,14 +153,14 @@ LLM行为数据 ──IRL──→ 人类价值权重 ──注入RL──→ �
 │                     执行层 (Execution)                            │
 │                                                                   │
 │  ┌──────────────────┐  ┌──────────────────┐  ┌───────────────┐  │
-│  │ 批量社会力模型    │  │ P-MAPPO RL调度    │  │ 群体智能       │  │
+│  │ 批量社会力模型    │  │ 分区独立 PPO（Zone-PPO） RL调度    │  │ 群体智能       │  │
 │  │ Numba JIT单次调用 │  │ 4 Zone MLP推理   │  │ 信息传播+恐惧  │  │
 │  │ 800人×1调用≈3ms  │  │ IRL权重驱动奖励  │  │ +体力+记忆    │  │
 │  └──────────────────┘  └──────────────────┘  └───────────────┘  │
 ├──────────────────────────────────────────────────────────────────┤
 │                 LLM → IRL → RL 三级联级 (v2.1核心)                 │
 │                                                                   │
-│  LLM轨迹数据 ──→ MaxEnt IRL ──→ 奖励权重 ──→ P-MAPPO RL调度      │
+│  LLM轨迹数据 ──→ MaxEnt IRL ──→ 奖励权重 ──→ 分区独立 PPO（Zone-PPO） RL调度      │
 │  12万条决策      恢复5个价值维度   注入RL奖励函数   中文建议→Prompt │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -318,7 +323,7 @@ python main.py --config config/mall_floorplan.yaml --agents 200 --no-viz
 python -m execution.irl_recovery --trajectory_dir data/trajectories --output data/irl_weights.json
 ```
 
-#### `rl_scheduler.py` — P-MAPPO区域调度器 (~560行)
+#### `rl_scheduler.py` — 分区独立 PPO（Zone-PPO）区域调度器 (~560行)
 
 **ZoneDefinition**：150m×80m商场4象限：
 | Zone | 名称 | 范围 | 主要出口 |
@@ -491,7 +496,7 @@ VLM提供语义理解（"左侧有浓烟"），YOLO提供精确数据（"右上�
 **主要贡献声明**：
 1. 提出了LLM→IRL→RL三级联级架构，实现了从人类行为数据到调度策略的知识迁移
 2. 用MaxEnt IRL从12万条LLM决策轨迹中恢复了5种人设的可区分价值权重
-3. 设计了基于IRL权重的P-MAPPO区域调度器，将学到的价值偏好转化为出口推荐策略
+3. 设计了基于IRL权重的分区独立 PPO（Zone-PPO）区域调度器，将学到的价值偏好转化为出口推荐策略
 4. 在真实商场场景(150m×80m, 8出口, 600 Agent)中验证了三级架构的有效性
 
 ### 8.2 面试话术（2分钟版）
@@ -581,7 +586,7 @@ single_gpu_evacuation/
 │   ├── orchestrator.py              #   主仿真循环 (v2.1: +IRL采集+RL调度)
 │   ├── batched_physics.py           #   批量社会力模型 (Numba JIT)
 │   ├── irl_recovery.py              #   ★ MaxEnt IRL轨迹采集+权重学习 [v2.1]
-│   ├── rl_scheduler.py              #   ★ P-MAPPO区域调度+建议注入 [v2.1]
+│   ├── rl_scheduler.py              #   ★ 分区独立 PPO（Zone-PPO）区域调度+建议注入 [v2.1]
 │   ├── reward_analysis.py           #   ★ IRL权重分析+雷达图+KL散度 [v2.1]
 │   ├── diffusion_policy.py          #   扩散模型轨迹生成 (实验性v2.0)
 │   └── diffusion_trainer.py         #   扩散模型训练脚本
@@ -625,7 +630,7 @@ single_gpu_evacuation/
 | 知识库 | ChromaDB + BGE-small-zh | 轻量中文语义检索 |
 | 物理引擎 | Numba JIT | 批量编译, 不离开Python |
 | **IRL算法** | **MaxEnt IRL** | **最大熵原则, 适合多样化人类行为** |
-| **RL框架** | **P-MAPPO (轻量MLP)** | **4 zone <1ms推理, 共享参数** |
+| **RL框架** | **分区独立 PPO（Zone-PPO） (轻量MLP)** | **4 zone <1ms推理, 共享参数** |
 | 微调 | QLoRA (PEFT + BnB) | 4GB显存训练, 15MB adapter |
 | 可视化 | Matplotlib + Plotly | 论文图表 + 交互式分析 |
 | 前端 | Gradio 6.0 + Flask | 交互式Dashboard + Web监控 |
@@ -642,7 +647,7 @@ single_gpu_evacuation/
   note      = {Single GPU (RTX 4090) Edition.
                LLM→IRL→RL cascade: LLM generates behavior data →
                MaxEnt IRL recovers value weights (5 personas × 5 features) →
-               P-MAPPO RL optimizes zone-level scheduling.
+               分区独立 PPO（Zone-PPO） RL optimizes zone-level scheduling.
                Three-layer perception-cognition-execution architecture
                with 7 hard safety constraints, VLM+YOLO dual perception,
                and QLoRA fine-tuning pipeline.},

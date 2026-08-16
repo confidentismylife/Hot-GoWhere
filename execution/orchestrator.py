@@ -21,9 +21,11 @@ from decision.cognitive_engine import LLMCognitiveEngine, DecisionResult
 from decision.knowledge_base import DisasterKnowledgeBase
 from decision.safety_guard import SafetyGuard
 from decision.agent_roles import AgentRole, define_zones
+from decision.policy import HeuristicPolicy
 from perception.environment import DisasterSimulator, EnvironmentSnapshot
 from execution.batched_physics import BatchedPhysics
 from execution.diffusion_policy import build_scene_map
+from execution.agent_factory import random_profile, create_family_groups
 from execution.irl_recovery import TrajectoryCollector
 from execution.rl_scheduler import RLZoneScheduler, inject_rl_preferences, DEFAULT_ZONES
 from execution.tactical_layer import TacticalLayer
@@ -33,7 +35,9 @@ from group_intel.propagation import GroupIntelligence
 class SimulationOrchestrator:
     """Coordinates the full simulation pipeline."""
 
-    def __init__(self, config_path: str = "config/default.yaml"):
+    def __init__(self, config_path: str = "config/default.yaml",
+                 llm_engine: Optional[LLMCognitiveEngine] = None,
+                 keep_llm_engine: bool = False):
         with open(config_path, 'r', encoding='utf-8') as f:
             self.cfg = yaml.safe_load(f)
 
@@ -79,21 +83,32 @@ class SimulationOrchestrator:
             self.exits = [tuple(e) for e in env["exit_positions"]]
             self.obstacles = env.get("obstacles", [])
 
-        # Disaster
+        # Disaster — supports one or more fire origins
         disaster_origin = env.get("disaster_origin", (self.width * 0.2, self.height * 0.5))
         if self.floorplan and env.get("disaster_origin") is None:
             disaster_origin = self.floorplan.disaster_origin_default
+        fire_sources = env.get("fire_sources")
+        self.fire_origins = (
+            [tuple(o) for o in fire_sources]
+            if fire_sources else [tuple(disaster_origin)]
+        )
         self.disaster = DisasterSimulator(
             width=self.width, height=self.height,
             disaster_type=env["disaster"],
-            origin=tuple(disaster_origin),
+            origin=self.fire_origins,
             spread_rate=env["disaster_spread_rate"],
             resolution=0.5,
             wall_mask=(self.floorplan.grid if self.floorplan else None),
         )
 
-        # LLM Engine
-        self.llm_engine = LLMCognitiveEngine(config=llm_cfg)
+        # LLM Engine — may be injected from outside so multiple simulation
+        # runs share one loaded vLLM engine (load once, run all seeds).
+        self._external_llm_engine = llm_engine
+        self._keep_llm_engine = keep_llm_engine or (llm_engine is not None)
+        if llm_engine is not None:
+            self.llm_engine = llm_engine
+        else:
+            self.llm_engine = LLMCognitiveEngine(config=llm_cfg)
         self.knowledge_base = DisasterKnowledgeBase(
             persist_dir=self.cfg.get("knowledge_base", {}).get("persist_dir")
         )
@@ -110,6 +125,7 @@ class SimulationOrchestrator:
 
         # Safety guard (hard constraints on LLM output)
         self.safety_guard = SafetyGuard()
+        self.heuristic_policy = HeuristicPolicy()
 
         # Agents
         self.agents: List[Agent] = []
@@ -138,10 +154,18 @@ class SimulationOrchestrator:
         # RL zone scheduling
         rl_cfg = self.cfg.get("rl_scheduling", {})
         self.enable_rl_scheduling = rl_cfg.get("enabled", False)
+        self._rl_smoke_block = float(
+            rl_cfg.get("smoke_block_threshold", 0.6))
+        self._rl_fire_path_block = bool(
+            rl_cfg.get("fire_path_block", True))
         self.zone_scheduler: Optional[RLZoneScheduler] = None
         self._rl_zones = DEFAULT_ZONES  # May be overridden by YAML config
         self._zone_actions = None  # Cached per-tick zone actions
         self._rl_preferences_cache: Dict[str, str] = {}  # agent_id → NL advice
+        self.rl_policy_loaded = False  # True only if pretrained MLP weights loaded
+        self.role_stats = None  # Filled by _compute_role_stats() at end of run
+        self.avg_tick_ms = 0.0  # Filled at end of run
+        self.max_tick_ms = 0.0  # Filled at end of run
 
     # ================================================================
     # Agent Generation
@@ -167,46 +191,8 @@ class SimulationOrchestrator:
               f"across {self.width}×{self.height}m environment.")
 
     def _random_profile(self, idx: int) -> AgentProfile:
-        ac = self.agent_cfg
-
-        # Age
-        age_roll = random.random()
-        if age_roll < 0.35:
-            age = random.randint(18, 35)
-        elif age_roll < 0.80:
-            age = random.randint(36, 55)
-        else:
-            age = random.randint(56, 80)
-
-        # Familiarity
-        fam_roll = random.random()
-        if fam_roll < 0.3:
-            familiarity = random.uniform(0.0, 0.3)
-        elif fam_roll < 0.8:
-            familiarity = random.uniform(0.3, 0.7)
-        else:
-            familiarity = random.uniform(0.7, 1.0)
-
-        # Max speed (age-dependent)
-        if age < 35:
-            max_speed = random.uniform(1.2, 2.0)
-        elif age < 55:
-            max_speed = random.uniform(1.0, 1.6)
-        else:
-            max_speed = random.uniform(0.6, 1.2)
-
-        return AgentProfile(
-            age=age,
-            gender=random.choice(["male", "female"]),
-            occupation=random.choice(["office_worker", "student", "shopkeeper",
-                                       "tourist", "security_guard", "retiree"]),
-            familiarity=familiarity,
-            max_speed=max_speed,
-            risk_aversion=random.uniform(0.2, 0.9),
-            altruism=random.uniform(0.1, 0.8),
-            trust_authority=random.uniform(0.3, 0.95),
-            conformity=random.uniform(0.1, 0.9),
-        )
+        """Generate one agent profile from config-driven distributions."""
+        return random_profile(self.agent_cfg)
 
     def _random_dynamic(self, profile: AgentProfile) -> AgentDynamic:
         # Random starting position (avoid walls, obstacles and exits)
@@ -264,30 +250,10 @@ class SimulationOrchestrator:
 
     def _create_family_groups(self):
         """Group some agents into family units."""
-        prob = self.agent_cfg.get("family_group_probability", 0.3)
-        if prob <= 0:
-            return
-
-        # Find agents eligible for family grouping
-        eligible = [a for a in self.agents if a.profile.age < 60]
-        random.shuffle(eligible)
-
-        family_count = int(len(eligible) * prob / 2)
-        for _ in range(family_count):
-            if len(eligible) < 2:
-                break
-            a1 = eligible.pop()
-            a2 = eligible.pop()
-
-            # Link them
-            a1.dynamic.family_member_ids.append(a2.id)
-            a2.dynamic.family_member_ids.append(a1.id)
-
-            # Maybe add a child or elderly
-            if random.random() < 0.3:
-                a1.dynamic.has_children = True
-            if random.random() < 0.3:
-                a2.dynamic.has_elderly = a2.profile.age > 55
+        new_members = create_family_groups(self.agents, self.agent_cfg)
+        if new_members:
+            self.agents.extend(new_members)
+            self._rebuild_lookup()
 
     def _spawn_command_agents(self):
         """Spawn multi-role command agents (commander, firefighter, guide).
@@ -467,6 +433,8 @@ class SimulationOrchestrator:
             self._spawn_command_agents()
         if self.use_llm:
             self.llm_engine.initialize()
+            if self.cfg.get("llm", {}).get("fixed_seed", False):
+                self.llm_engine.set_seed(self.seed)
 
         # IRL trajectory collection
         if self.enable_irl_collection:
@@ -537,6 +505,7 @@ class SimulationOrchestrator:
             self.zone_scheduler.initialize(
                 pretrained_path=pretrained if pretrained else None
             )
+            self.rl_policy_loaded = self.zone_scheduler._pretrained_loaded
             # Load IRL weights if available
             irl_weights_path = rl_cfg.get("irl_weights")
             if irl_weights_path and os.path.exists(irl_weights_path):
@@ -661,8 +630,8 @@ class SimulationOrchestrator:
                 # Give every agent an immediate heuristic decision
                 heur_decisions = {}
                 for agent in agents_to_decide:
-                    heur_decisions[agent.id] = TacticalLayer.heuristic_decision(
-                        agent, env_snapshot, self.exits)
+                    heur_decisions[agent.id] = self.heuristic_policy.decide(
+                        agent, env_snapshot, self.exits, tick=self.tick)
                 if heur_decisions:
                     self._apply_decisions(heur_decisions, env_snapshot)
                     self.decision_count += len(heur_decisions)
@@ -674,37 +643,8 @@ class SimulationOrchestrator:
             if not self.use_llm and agents_to_decide:
                 heur_decisions = {}
                 for agent in agents_to_decide:
-                    pos = agent.dynamic.position
-                    best_exit_idx = 0
-                    best_score = float('inf')
-                    for i, ex in enumerate(self.exits):
-                        ex_arr = np.array(ex, dtype=np.float64)
-                        dist = np.linalg.norm(pos - ex_arr)
-                        smoke = env_snapshot.smoke_at(ex_arr)
-                        if smoke > 0.8:
-                            continue
-                        score = dist * (1.0 + smoke * 3.0)
-                        if score < best_score:
-                            best_score = score
-                            best_exit_idx = i
-                    local_smoke = env_snapshot.smoke_at(pos)
-                    if local_smoke > 0.6:
-                        spd = Speed.CRAWL
-                    elif local_smoke > 0.3:
-                        spd = Speed.WALK
-                    else:
-                        spd = Speed.WALK
-                    d = DecisionResult(
-                        agent_id=agent.id,
-                        target_exit_idx=best_exit_idx,
-                        target_exit_pos=tuple(self.exits[best_exit_idx]),
-                        speed=spd,
-                        cooperation=Cooperation.NONE,
-                        reasoning=f"[SFM] exit {best_exit_idx+1}",
-                        risk_assessment="low",
-                        compute_time=0.0,
-                    )
-                    heur_decisions[agent.id] = d
+                    heur_decisions[agent.id] = self.heuristic_policy.decide(
+                        agent, env_snapshot, self.exits, tick=self.tick)
                 if heur_decisions:
                     self._apply_decisions(heur_decisions, env_snapshot)
 
@@ -714,7 +654,9 @@ class SimulationOrchestrator:
                 for agent in agents_to_decide:
                     advice = inject_rl_preferences(
                         self._zone_actions, self._rl_zones,
-                        agent, env_snapshot)
+                        agent, env_snapshot,
+                        smoke_block_threshold=self._rl_smoke_block,
+                        fire_path_block=self._rl_fire_path_block)
                     if advice:
                         self._rl_preferences_cache[agent.id] = advice
 
@@ -768,6 +710,7 @@ class SimulationOrchestrator:
                 env_snapshot.official_broadcast, self.dt)
             self.group_intel.update_fear_levels(self.agents, env_snapshot, self.dt)
             self.group_intel.update_stamina(self.agents, self.dt)
+            self.group_intel.update_hazard_damage(self.agents, env_snapshot, self.dt)
 
             # ---- 4.5 Tactical Layer (Brain-Torso: per-tick reactive adjustments) ----
             TacticalLayer.adjust_all(self.agents, env_snapshot, self.exits, self.tick)
@@ -775,8 +718,10 @@ class SimulationOrchestrator:
             # ---- 5. Physics ----
             if self.use_diffusion and self.diffusion_policy is not None:
                 self._step_diffusion(env_snapshot)
+                self._mark_evacuated_timestamps()
             else:
                 self.physics.step_all(self.agents, self.dt)
+                self._mark_evacuated_timestamps()
 
             # ---- 6. Stats update (single pass) ----
             evac = 0; dead = 0
@@ -842,7 +787,7 @@ class SimulationOrchestrator:
         if self.diffusion_policy is not None:
             self.diffusion_policy.shutdown()
 
-        if self.use_llm:
+        if self.use_llm and not self._keep_llm_engine:
             self.llm_engine.shutdown()
 
         # Save IRL trajectory data
@@ -854,6 +799,11 @@ class SimulationOrchestrator:
             self.trajectory_collector.save(traj_path)
             print(f"[Orchestrator] Trajectories saved to {traj_path}")
 
+        self.avg_tick_ms = float(np.mean(tick_times)) if tick_times else 0.0
+        self.max_tick_ms = float(np.max(tick_times)) if tick_times else 0.0
+        self._compute_role_stats()
+        self.safety_rule_counts = dict(
+            getattr(self.safety_guard, "counters", {}))
         self._print_summary(tick_times)
 
     def _apply_decisions(self, decisions: Dict[str, DecisionResult],
@@ -918,6 +868,7 @@ class SimulationOrchestrator:
 
             # Apply final decision to agent
             agent.dynamic.target_exit = target_exit
+            agent.dynamic.target_exit_idx = target_idx
             agent.dynamic.speed_choice = speed
             agent.dynamic.cooperation_choice = cooperation
             agent.dynamic.reasoning_text = reasoning
@@ -948,6 +899,14 @@ class SimulationOrchestrator:
     def _find_agent(self, agent_id: str):
         """Find agent by ID. Returns None if not found. O(1) via lookup dict."""
         return self._agent_lookup.get(agent_id)
+
+    def _mark_evacuated_timestamps(self):
+        """Stamp the real sim time/tick on agents evacuated this step."""
+        for a in self.agents:
+            d = a.dynamic
+            if d.evacuated and d.evacuation_time < 0:
+                d.evacuation_time = self.sim_time
+                d.evacuation_tick = self.tick
 
     def _load_zones_from_config(self):
         """Load zone definitions from YAML config, falling back to DEFAULT_ZONES."""
@@ -1040,6 +999,7 @@ class SimulationOrchestrator:
                         agent.dynamic.target_exit = np.array(
                             env_snapshot.exits[i - 1], dtype=np.float64
                         )
+                        agent.dynamic.target_exit_idx = i - 1
                         break
 
                 if call and route:
@@ -1180,12 +1140,26 @@ class SimulationOrchestrator:
         from execution.irl_recovery import IRLRecovery
 
         print("\n" + "=" * 60)
-        print("   RL Zone Scheduler — Offline Training (P-MAPPO)")
+        print("   RL Zone Scheduler — Offline Training (Zone-PPO)")
         print("=" * 60)
 
         zones = self._load_zones_from_config()
 
-        scheduler = RLZoneScheduler(zones=zones, num_exits=len(self.exits))
+        training_seed = int(self.cfg.get("simulation", {}).get("seed", 42))
+        scheduler = RLZoneScheduler(
+            zones=zones,
+            num_exits=len(self.exits),
+            seed=training_seed,
+            blocked_exit_penalty=float(
+                self.cfg.get("rl_scheduling", {}).get(
+                    "blocked_exit_penalty", 0.0)),
+            smoke_block_threshold=float(
+                self.cfg.get("rl_scheduling", {}).get(
+                    "smoke_block_threshold", 0.6)),
+            outcome_reward_weight=float(
+                self.cfg.get("rl_scheduling", {}).get(
+                    "outcome_reward_weight", 0.0)),
+        )
         scheduler.initialize()
 
         # Load IRL weights
@@ -1198,7 +1172,11 @@ class SimulationOrchestrator:
             print(f"[TrainRL] IRL weights not found at {irl_weights_path}, "
                   f"using default balanced weights")
 
-        # Create fast training simulator with real mall floor plan exits
+        # Create fast training simulator with real mall floor plan exits.
+        # In extreme mode it uses the deployment fire sources / spread rate
+        # and jitters the origins every episode so the policy generalizes.
+        train_env = self.cfg.get("environment", {})
+        train_rl_cfg = self.cfg.get("rl_scheduling", {})
         sim = FastTrainingSimulator(
             width=self.width,
             height=self.height,
@@ -1206,6 +1184,12 @@ class SimulationOrchestrator:
             num_exits=len(self.exits),
             zone_defs=zones,
             exit_positions=[(float(e[0]), float(e[1])) for e in self.exits],
+            seed=training_seed,
+            fire_sources=train_env.get("fire_sources"),
+            spread_rate=train_env.get("disaster_spread_rate"),
+            origin_jitter=float(train_rl_cfg.get("origin_jitter", 15.0)),
+            smoke_block_threshold=float(
+                train_rl_cfg.get("smoke_block_threshold", 0.6)),
         )
 
         print(f"[TrainRL] Simulator: {self.width}×{self.height}m, "
@@ -1229,6 +1213,39 @@ class SimulationOrchestrator:
     # Summary
     # ================================================================
 
+    def _compute_role_stats(self):
+        """Break down evacuation/casualty counts by civilian vs command agents.
+
+        Command agents (commander / area commander / firefighter / guide) are
+        spawned on top of the CLI ``--agents`` count, so including them in the
+        denominator dilutes the civilian evacuation rate. This split is stored
+        on ``self.role_stats`` for the summary and for external comparison
+        scripts.
+        """
+        civilians = [a for a in self.agents
+                     if a.profile.role == AgentRole.CIVILIAN.value]
+        commands = [a for a in self.agents
+                    if a.profile.role != AgentRole.CIVILIAN.value]
+
+        def split_stats(group):
+            n = len(group)
+            evac = sum(1 for a in group if a.dynamic.evacuated)
+            dead = sum(1 for a in group if not a.dynamic.alive)
+            return {
+                "total": n,
+                "evacuated": evac,
+                "casualties": dead,
+                "remaining": n - evac - dead,
+                "evac_rate": evac / n if n else 0.0,
+                "casualty_rate": dead / n if n else 0.0,
+            }
+
+        self.role_stats = {
+            "civilian": split_stats(civilians),
+            "command": split_stats(commands),
+            "all": split_stats(self.agents),
+        }
+
     def _print_summary(self, tick_times: List[float]):
         print("\n" + "=" * 60)
         print("   SIMULATION COMPLETE")
@@ -1245,9 +1262,28 @@ class SimulationOrchestrator:
               f"({self.evacuated_count/total_n*100:.1f}%)")
         print(f"  Casualties:       {self.casualty_count} "
               f"({self.casualty_count/total_n*100:.1f}%)")
+        if getattr(self, "role_stats", None):
+            for key, label in (("civilian", "Civilians"),
+                               ("command", "Command")):
+                s = self.role_stats[key]
+                if not s["total"]:
+                    continue
+                print(f"  [{label:9s}] {s['total']:4d} agents | "
+                      f"evac {s['evacuated']:4d} ({s['evac_rate']*100:5.1f}%) | "
+                      f"casualty {s['casualties']:3d} "
+                      f"({s['casualty_rate']*100:5.1f}%) | "
+                      f"remaining {s['remaining']:4d}")
+        if getattr(self, "enable_rl_scheduling", False):
+            loaded = self.rl_policy_loaded
+            print(f"  RL policy:        "
+                  f"{'LOADED (trained weights)' if loaded else 'NOT LOADED (heuristic advice fallback)'}")
         print(f"  LLM decisions:    {self.decision_count}")
         print(f"  Safety blocked:   {self.safety_blocks}")
         print(f"  Safety modified:  {self.safety_modifications}")
+        rule_counts = getattr(self, "safety_rule_counts", {})
+        if rule_counts:
+            detail = " ".join(f"{k}={v}" for k, v in rule_counts.items())
+            print(f"  Safety rules:    {detail}")
         avg_llm = (self.total_llm_time / self.decision_count * 1000
                    if self.decision_count > 0 else 0)
         print(f"  Avg LLM latency:  {avg_llm:.0f}ms/decision")

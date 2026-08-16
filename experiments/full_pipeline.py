@@ -121,18 +121,66 @@ def run_irl_fitting(trajectory_dir: str, output_path: str):
     print(f"[IRL] Weights saved to {output_path}")
 
 
-def run_rl_training(num_exits: int, episodes: int,
+def run_rl_training(config_path: str, episodes: int,
                     irl_weights_path: str, output_path: str):
-    """Train RL zone scheduler with IRL weights."""
+    """Train RL zone scheduler with IRL weights.
+
+    The fast simulator is built from the SAME config/floorplan that will be
+    used for validation (dims, exits, zones), so the trained policy matches
+    the deployment environment instead of a hardcoded 150x80 / 4-exit map.
+    """
     from execution.rl_scheduler import (
-        RLZoneScheduler, FastTrainingSimulator, DEFAULT_ZONES,
+        RLZoneScheduler, FastTrainingSimulator, ZoneDefinition, DEFAULT_ZONES,
     )
     from execution.irl_recovery import IRLRecovery
 
-    # Use 4-zone layout matching mall floorplan
-    zones = DEFAULT_ZONES
+    with open(config_path, 'r', encoding='utf-8') as f:
+        cfg = yaml.safe_load(f)
+    env = cfg.get("environment", {})
+    sim_cfg = cfg.get("simulation", {})
 
-    scheduler = RLZoneScheduler(zones=zones, num_exits=num_exits)
+    # Resolve the actual environment from the floorplan + config overrides.
+    if env.get("type") == "mall" or env.get("floorplan"):
+        from perception.floorplan import get_floorplan
+        fp = get_floorplan(env.get("floorplan", "chaoyang_joycity_1f"))
+        width, height = fp.width, fp.height
+        exit_positions = ([tuple(e) for e in env["exit_positions"]]
+                          if env.get("exit_positions") else fp.exits)
+    else:
+        width = float(env.get("width", 100.0))
+        height = float(env.get("height", 60.0))
+        exit_positions = [tuple(e) for e in env.get("exit_positions", [])]
+    num_exits = len(exit_positions)
+
+    # Zone layout: use config zones when present, else DEFAULT_ZONES.
+    zones_cfg = cfg.get("zones")
+    if zones_cfg:
+        zones = [
+            ZoneDefinition(
+                zone_id=z["id"],
+                name=z.get("name", f"Zone{z['id']}"),
+                x_min=z["x_min"], x_max=z["x_max"],
+                y_min=z["y_min"], y_max=z["y_max"],
+                primary_exits=z.get("primary_exits", list(range(num_exits))),
+                description=z.get("description", ""),
+            )
+            for z in zones_cfg
+        ]
+    else:
+        zones = DEFAULT_ZONES
+
+    training_seed = int(sim_cfg.get("seed", 42))
+    scheduler = RLZoneScheduler(
+        zones=zones,
+        num_exits=num_exits,
+        seed=training_seed,
+        blocked_exit_penalty=float(
+            cfg.get("rl_scheduling", {}).get("blocked_exit_penalty", 0.0)),
+        smoke_block_threshold=float(
+            cfg.get("rl_scheduling", {}).get("smoke_block_threshold", 0.6)),
+        outcome_reward_weight=float(
+            cfg.get("rl_scheduling", {}).get("outcome_reward_weight", 0.0)),
+    )
     scheduler.initialize()
 
     # Load IRL weights
@@ -145,22 +193,30 @@ def run_rl_training(num_exits: int, episodes: int,
         print(f"[RL Train] WARNING: IRL weights not found at {irl_weights_path}")
         print(f"[RL Train] Using default balanced weights")
 
-    exit_positions = [(75, 2), (2, 40), (148, 40), (75, 78)]
-
     sim = FastTrainingSimulator(
-        width=150, height=80,
-        num_agents=600,
+        width=width, height=height,
+        num_agents=int(sim_cfg.get("num_agents", 600)),
         num_exits=num_exits,
         zone_defs=zones,
         exit_positions=exit_positions,
+        seed=training_seed,
+        fire_sources=env.get("fire_sources"),
+        spread_rate=env.get("disaster_spread_rate"),
+        origin_jitter=float(
+            cfg.get("rl_scheduling", {}).get("origin_jitter", 15.0)),
+        smoke_block_threshold=float(
+            cfg.get("rl_scheduling", {}).get("smoke_block_threshold", 0.6)),
     )
 
+    print(f"[RL Train] Environment: {width:.0f}x{height:.0f}m, "
+          f"{num_exits} exits, {len(zones)} zones")
     print(f"[RL Train] Starting {episodes} episodes...")
     t0 = time.time()
+    steps_per_episode = int(float(sim_cfg.get("duration", 360.0)) / sim.dt)
     history = scheduler.train_offline(
         env_simulator=sim,
         episodes=episodes,
-        steps_per_episode=360,
+        steps_per_episode=steps_per_episode,
         save_path=output_path,
     )
     elapsed = time.time() - t0
@@ -267,12 +323,8 @@ def main():
     # ================================================================
     if not args.skip_rl:
         step_banner(3, "Train RL Zone Scheduler", total_steps)
-        # Determine num_exits from config
-        with open(args.config, 'r', encoding='utf-8') as f:
-            cfg = yaml.safe_load(f)
-        num_exits = len(cfg.get("environment", {}).get("exit_positions", [
-            [75, 2], [2, 40], [148, 40], [75, 78]]))
-        run_rl_training(num_exits, args.rl_episodes, irl_weights_path, rl_policy_path)
+        run_rl_training(args.config, args.rl_episodes,
+                        irl_weights_path, rl_policy_path)
     else:
         step_banner(3, "SKIP RL (using existing)", total_steps)
 

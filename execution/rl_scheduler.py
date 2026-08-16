@@ -1401,7 +1401,8 @@ class FastTrainingSimulator:
                  fire_sources: List[Tuple[float, float]] = None,
                  spread_rate: float = None,
                  origin_jitter: float = 15.0,
-                 smoke_block_threshold: float = 0.6):
+                 smoke_block_threshold: float = 0.6,
+                 advice_accept_rate: float = 0.6):
         self.width = width
         self.height = height
         self.num_agents = num_agents
@@ -1415,6 +1416,13 @@ class FastTrainingSimulator:
         self.spread_rate = spread_rate
         self.origin_jitter = origin_jitter
         self.smoke_block_threshold = smoke_block_threshold
+        # Deployment-realism knob (route-A): in the real pipeline the RL
+        # advice is injected into LLM prompts and only adopted with some
+        # probability; SafetyGuard further overrides decisions (~31% in
+        # measured runs). The training simulator must model this broken
+        # action→outcome link, otherwise the learned policy assumes a
+        # causal chain that does not exist at deployment time.
+        self.advice_accept_rate = float(np.clip(advice_accept_rate, 0.0, 1.0))
 
         rng = np.random.RandomState(self.seed)
         self._rng = rng
@@ -1470,6 +1478,12 @@ class FastTrainingSimulator:
         self.agent_stamina = rng.uniform(60.0, 100.0, num_agents).astype(np.float32)
         self.agent_age = rng.uniform(18, 70, num_agents).astype(np.float32)
         self.agent_trained = rng.random(num_agents) < 0.1
+        # Per-agent advice receptiveness: an agent only blends the zone
+        # preference into its exit choice if it "adopts" the RL advice
+        # (mimics the LLM following or ignoring prompt-injected guidance).
+        # Drawn once per episode so the adoption set is stable within it.
+        self.agent_accepts_advice = (
+            rng.random(num_agents) < self.advice_accept_rate)
 
         # Initial positions (random, avoiding walls near center)
         for i in range(num_agents):
@@ -1519,6 +1533,10 @@ class FastTrainingSimulator:
         self.agent_evacuated.fill(False)
         self.agent_stamina = self._initial_stamina.copy()
         self.agent_fear = self._initial_fear.copy()
+        # Re-sample the advice-adoption set each episode (uses the
+        # episode-scoped rng, so adoption varies across episodes).
+        self.agent_accepts_advice = (
+            self._rng.random(self.num_agents) < self.advice_accept_rate)
         self.agent_target_exits = self._initial_target_exits.copy()
         self._init_fire(self._rng)
 
@@ -1653,9 +1671,11 @@ class FastTrainingSimulator:
                     all_blocked = False
                     heuristic_score = d + smoke * 200
 
-                    # Blend with zone recommendation if available
+                    # Blend with zone recommendation if available — but only
+                    # for agents that adopt the advice (route-A realism).
                     zone_pref = 0.0
-                    if zone_actions is not None:
+                    accepts = self.agent_accepts_advice[i]
+                    if zone_actions is not None and accepts:
                         for zone in self.zones:
                             if (zone.x_min <= self.agent_positions[i, 0] < zone.x_max and
                                 zone.y_min <= self.agent_positions[i, 1] < zone.y_max):
@@ -1663,8 +1683,13 @@ class FastTrainingSimulator:
                                 if act is not None:
                                     zone_pref = act.exit_preferences[e]
                                 break
-                    # Blend: 50% heuristic + 50% zone preference
-                    score = heuristic_score * 0.5 - zone_pref * 60.0
+                    if accepts and zone_actions is not None:
+                        # Blend: 50% heuristic + 50% zone preference
+                        score = heuristic_score * 0.5 - zone_pref * 60.0
+                    else:
+                        # Non-adopters (and no-advice runs) follow pure
+                        # heuristic — the deployment fallback behavior.
+                        score = heuristic_score
                     if score < best_score:
                         best_score = score
                         best_exit = e

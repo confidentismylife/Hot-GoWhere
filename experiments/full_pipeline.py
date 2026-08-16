@@ -206,6 +206,8 @@ def run_rl_training(config_path: str, episodes: int,
             cfg.get("rl_scheduling", {}).get("origin_jitter", 15.0)),
         smoke_block_threshold=float(
             cfg.get("rl_scheduling", {}).get("smoke_block_threshold", 0.6)),
+        advice_accept_rate=float(
+            cfg.get("rl_scheduling", {}).get("advice_accept_rate", 0.6)),
     )
 
     print(f"[RL Train] Environment: {width:.0f}x{height:.0f}m, "

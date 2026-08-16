@@ -101,6 +101,8 @@ rl_scheduling:
   blocked_exit_penalty: 1.0        # 训练奖励: 推荐被封锁出口的惩罚
   origin_jitter: 15.0              # 训练时每轮火源随机抖动幅度 (m)
   outcome_reward_weight: 0.3       # 结果导向奖励项权重（靠近出口+生存+体力）
+  advice_accept_rate: 0.6          # 路线A: 训练时 agent 采纳 RL 建议的概率
+                                   # （模拟部署时 LLM 可能忽略建议 + 护栏约 31% 拦截）
 
 zones:
   - {id: 0, name: "西北区", x_min: 0,   x_max: 100, y_min: 60, y_max: 120, primary_exits: [0,2,3], description: "商场西北区域"}

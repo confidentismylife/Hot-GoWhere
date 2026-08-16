@@ -6,14 +6,14 @@
 
 ---
 
-> **核心创新**：提出 **LLM → IRL → RL 三级联级架构**——LLM 生成多样化人类行为数据 → 逆强化学习(IRL)恢复隐式价值权重 → 多智能体强化学习(RL)使用学到的人类价值偏好进行区域级调度优化。解决了"LLM + RL 只是两个已有技术的组合，缺乏本质性算法创新"的审稿痛点。
+> **架构说明（v2.2 路线A 修订）**：本系统采用 **LLM 认知仿真 + 安全护栏 + RL 区域调度辅助** 三层架构。RL 的奖励权重为**基于疏散行为文献手工设计的 5 维价值权重**（见 `data/irl_weights.json` 的 `_provenance` 字段）；仓库中保留的 MaxEnt IRL 管线为实验性组件，其局限性（奖励不可辨识性、轨迹来源）已在 `execution/irl_recovery.py` 头部注释中如实说明。
 
 ---
 
 ## 目录
 
 - [1. 项目定位与核心创新](#1-项目定位与核心创新)
-- [2. LLM → IRL → RL 三级联级架构](#2-llm--irl--rl-三级联级架构)
+- [2. 架构：LLM 认知仿真 + RL 区域调度辅助](#2-架构llm-认知仿真--rl-区域调度辅助)
 - [3. 三层认知架构总览](#3-三层认知架构总览)
 - [4. 模块详解](#4-模块详解)
   - [4.1 感知层 (perception/)](#41-感知层-perception)
@@ -37,52 +37,55 @@
 
 | 层面 | 核心问题 | 本项目的回答 |
 |------|---------|------------|
-| 建模层 | LLM能否模拟多样化人类疏散行为？ | 5角色×5人设的600 Agent体系，LLM生成有人类心理特征的决策 |
+| 建模层 | LLM能否模拟多样化人类疏散行为？ | 5角色×5人设的 Agent 体系，LLM生成有人类心理特征的决策 |
 | 安全层 | LLM决策在安全关键场景中是否可靠？ | 7条硬约束安全护栏，LLM是"建议者"、护栏是"仲裁者" |
-| **价值层** | **能否从LLM行为中学习人类的隐式价值偏好？** | **MaxEnt IRL从12万条轨迹中恢复5维奖励权重** |
-| **调度层** | **学到的价值偏好能否指导全局最优调度？** | **分区独立 PPO（Zone-PPO）多智能体RL使用IRL权重进行区域级出口调度** |
-| 工程层 | 单卡消费级GPU能否支撑全链路？ | AWQ量化 + vLLM Prefix Caching + 异步流水线，800 Agent在RTX 4090上120ms/tick |
-
-**核心算法贡献**：LLM → IRL → RL 三级联级架构，实现了从"人类行为数据"到"价值偏好"再到"调度策略"的完整知识迁移链。
+| **价值层** | **调度奖励如何体现人类疏散偏好？** | 基于文献手工设计的 5 维价值权重（safety/efficiency/social/conformity/comfort），经敏感性分析验证；MaxEnt IRL 作为实验性对照保留 |
+| **调度层** | **价值权重能否指导全局调度？** | 分区独立 PPO（Zone-PPO）多智能体RL，训练环境内置"建议采纳率"建模以对齐部署因果链 |
+| 工程层 | 单卡消费级GPU能否支撑全链路？ | AWQ量化 + vLLM + 异步流水线（具体性能数字以实测为准，见 results/ 下实验记录） |
 
 ---
 
-## 2. LLM → IRL → RL 三级联级架构
+## 2. 架构：LLM 认知仿真 + RL 区域调度辅助
 
-### 2.1 架构动机
+### 2.1 架构动机与诚实声明
 
-传统"LLM + RL"融合方案的致命弱点是：**LLM和RL是并行加权关系，而非递进的知识迁移关系**。审稿人可以说"你只是把两个已有技术拼在一起"。
+本项目最初设想为 "LLM → IRL → RL" 三级级联（LLM 行为 → IRL 学权重 → RL 用权重调度）。经过对仓库证据的审查后，**v2.2 路线A 修订为如下诚实叙事**：
 
-本架构的关键洞察：**LLM教RL什么是好的决策**。不是并行的两个组件，而是三级递进的知识蒸馏：
+- 现有轨迹数据（`data/trajectories/`）由规则 Oracle 生成，**不是 LLM 行为**；
+- MaxEnt IRL 在线性特征下存在奖励不可辨识性（同一策略兼容多个奖励函数，参见 Skalse & Abate 2024），且特征存在共线性（comfort 是 safety 的别名，social/conformity 同源于 cooperation 字段），学习结果退化为 safety 独大或回退硬编码默认值；
+- 因此**部署权重为手工设计**（基于疏散行为文献），IRL 管线保留为实验性组件。
+
+当前架构的数据流：
 
 ```
-LLM行为数据 ──IRL──→ 人类价值权重 ──注入RL──→ 区域调度策略
-   ↑                      ↑                      ↑
-  阶段1                  阶段2                  阶段3
-"看人怎么做"          "理解人为什么这么做"    "用人看重的东西来调度"
+文献/专家知识 ──手工设计──→ 5维价值权重 ──注入RL奖励──→ 区域调度策略
+                                  │                          ↓
+LLM认知仿真（多角色Agent） ←── 自然语言建议注入Prompt ── 出口偏好
+        │
+        ↓
+安全护栏（7条硬约束，仲裁者）──→ 最终行动
 ```
 
-### 2.2 三级详解
+### 2.2 各层详解
 
-**第一级：LLM行为数据生成**
-- 600个Agent在150m×80m商场中由LLM驱动疏散决策
+**LLM 行为层**
+- 多 Agent 由 LLM 驱动疏散决策（角色：平民/引导员/消防员/指挥员）
 - 每次决策包含：出口选择、速度(跑/走/爬/等)、协作模式(帮家人/跟人群/带路人)
-- 200次仿真×600 Agent×约120次决策=约120,000条行为轨迹
-- 每条轨迹记录：(烟雾浓度, 火源距离, 出口距离, 速度选择, 协作模式, 恐慌水平)
+- 决策记录由 `TrajectoryCollector` 收集，可用于未来的 IRL 实验
 
-**第二级：MaxEnt IRL权重恢复**
-- 算法：Maximum Entropy IRL (Ziebart et al., 2008)
-- 核心假设：行为分布具有最大熵，受制于特征匹配约束——在处理多样化人类行为时比学徒学习更鲁棒
+**价值权重层（手工设计，非 IRL 学习）**
 - 5个奖励特征：**安全**(远离火/烟)、**效率**(近出口快速移动)、**社交**(帮家人带路人)、**从众**(跟人群听指挥)、**舒适**(走熟悉路线避免劳累)
 - 5种人设：未培训老人、未培训年轻人、已培训店员、引导员、消防员
-- 输出：每种人设的5维权重向量，如消防员 `w=[0.20, 0.10, 0.50, 0.05, 0.15]`——社交权重最高
+- 权重设计依据与注意事项见 `data/irl_weights.json` 的 `_provenance` 字段
+- MaxEnt IRL 管线（`execution/irl_recovery.py`）保留，用于未来真实 LLM 轨迹充足后的对照实验
 
-**第三级：分区独立 PPO（Zone-PPO）区域调度**
-- 将150m×80m商场划分为4个象限区域(NW/NE/SW/SE)
+**Zone-PPO 调度层**
+- 将商场划分为4个象限区域(NW/NE/SW/SE)
 - 每个区域一个分区独立 PPO（Zone-PPO）调度Agent (3层MLP, 观测→隐藏→出口偏好[-1,+1])
-- RL的奖励函数使用IRL恢复的人类价值权重——不是人工设计，是从LLM行为中学来的
+- 奖励函数使用上述 5 维价值权重 + 结果导向 shaping 项
+- **训练对齐部署（路线A）**：`FastTrainingSimulator` 内置 `advice_accept_rate` 参数（默认 0.6），模拟部署时"建议注入 LLM prompt → 可能被忽略 → 护栏拦截约 31%"的真实因果链，避免学到的策略假设一个不存在的动作→结果通路
 - RL输出转为中文自然语言建议，注入LLM Prompt：`【西北区调度中心建议】✅ 强烈推荐 出口3 ⚠️ 避免前往 出口2`
-- LLM仍做最终决策——RL只是"建议"，不替代LLM的人类判断力
+- LLM仍做最终决策——RL只是"建议"，不替代LLM的人类判断力；护栏是最终仲裁者
 
 > 实现说明：当前实现为 MAPPO 风格的 CTDE —— 各分区独立策略头（分散执行）+
 > 共享集中式价值网络（仅训练时使用）；联合策略为因子化高斯策略
@@ -104,22 +107,22 @@ LLM行为数据 ──IRL──→ 人类价值权重 ──注入RL──→ �
   - 各出口偏好分数 [-1, +1]
   - +1=强烈推荐, -1=避免前往
 
-奖励函数 (IRL学习):
+奖励函数 (手工设计的价值权重):
   R_zone = w_safety·f_safety + w_efficiency·f_efficiency
          + w_social·f_social + w_conformity·f_conformity
          + w_comfort·f_comfort
-  其中w来自IRL从LLM行为中恢复的各人设权重均值
+  其中w为基于文献手工设计的各人设权重均值（见 data/irl_weights.json）
 ```
 
-### 2.4 与已有方案的本质区别
+### 2.4 与已有方案的定位区别
 
-| 维度 | LLM+RL并行加权 | LLM→IRL→RL递进(本项目) |
-|------|:---:|:---:|
-| 融合关系 | LLM和RL独立输出，加权平均 | LLM→IRL→RL知识蒸馏链 |
-| RL的奖励 | 人工设计(距离+烟雾等) | 从LLM行为中学习的隐式价值 |
-| 理论深度 | 工程拼接 | 有IRL作为理论桥梁 |
-| 审稿风险 | "只是两个已有技术的组合" | "提出了三级知识迁移范式" |
-| 可解释性 | RL是黑盒 | IRL权重可视化：(谁看重什么) |
+| 维度 | 纯物理仿真（SFM/CA） | LLM 认知仿真（Berkeley 等） | 本项目 |
+|------|:---:|:---:|:---:|
+| 行为建模 | 理性粒子 | LLM persona 驱动 | LLM 多角色 + 护栏仲裁 |
+| 调度机制 | 无 | 无 | Zone-PPO 区域建议（辅助，非控制） |
+| 奖励来源 | — | — | 文献手工设计 5 维权重 + 敏感性分析 |
+| 训练/部署对齐 | — | — | 训练内置采纳率建模（advice_accept_rate） |
+| 验证方式 | 流量对比 | 真实数据校准 | 真实 LLM 仿真对比（固定 seed + 采纳率指标） |
 
 ---
 
@@ -155,13 +158,12 @@ LLM行为数据 ──IRL──→ 人类价值权重 ──注入RL──→ �
 │  ┌──────────────────┐  ┌──────────────────┐  ┌───────────────┐  │
 │  │ 批量社会力模型    │  │ 分区独立 PPO（Zone-PPO） RL调度    │  │ 群体智能       │  │
 │  │ Numba JIT单次调用 │  │ 4 Zone MLP推理   │  │ 信息传播+恐惧  │  │
-│  │ 800人×1调用≈3ms  │  │ IRL权重驱动奖励  │  │ +体力+记忆    │  │
+│  │ 800人×1调用≈3ms  │  │ 手工价值权重驱动奖励  │  │ +体力+记忆    │  │
 │  └──────────────────┘  └──────────────────┘  └───────────────┘  │
 ├──────────────────────────────────────────────────────────────────┤
-│                 LLM → IRL → RL 三级联级 (v2.1核心)                 │
+│                 价值权重 + RL 调度辅助 (v2.2 路线A)                  │
 │                                                                   │
-│  LLM轨迹数据 ──→ MaxEnt IRL ──→ 奖励权重 ──→ 分区独立 PPO（Zone-PPO） RL调度      │
-│  12万条决策      恢复5个价值维度   注入RL奖励函数   中文建议→Prompt │
+│  文献手工权重 ──→ 5维奖励 ──→ Zone-PPO 训练(含采纳率建模) ──→ 中文建议→Prompt │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -295,13 +297,13 @@ MID架构的条件扩散模型，生成Agent未来轨迹。DDIM 100步采样，�
 
 ### 4.5 IRL/Reward 管线 (execution/)
 
-这是v2.1的核心新增模块，实现LLM → IRL → RL三级联级架构。
+> **状态说明（v2.2 路线A）**：本模块中的 MaxEnt IRL 为**实验性组件**。当前部署的奖励权重为手工设计（见 `data/irl_weights.json` 的 `_provenance`）；轨迹数据目前由规则 Oracle 生成，且 MaxEnt 在线性特征下存在奖励不可辨识性，详见 `irl_recovery.py` 头部注释。
 
-#### `irl_recovery.py` — IRL轨迹采集+权重学习 (~500行)
+#### `irl_recovery.py` — 轨迹采集 + MaxEnt IRL（实验性，~500行）
 
 **TrajectoryCollector**：挂在Orchestrator上，实时采集每个Agent的决策轨迹。
 - 记录字段：(tick, 位置, 烟雾浓度, 火源距离, 出口距离, 速度选择, 协作模式, 恐慌水平, 是否被安全护栏拦截)
-- 输出：JSONL文件，200次仿真≈120,000条轨迹
+- 输出：JSONL文件
 
 **IRLRecovery**：Maximum Entropy IRL算法。
 - 输入：从JSONL加载的AgentTrajectory列表
@@ -390,8 +392,8 @@ python -m execution.reward_analysis --weights data/irl_weights.json --output dat
 | 决策模型 | if-else规则 | 策略网络 | LLM (GPT-4) | LLM + 安全护栏 |
 | 人类心理建模 | 无 | 间接(reward) | Prompt | **直接(恐惧/信任/利他)** |
 | 安全性保证 | 规则安全 | 黑盒 | **无** | **7条可审计约束** |
-| 奖励函数来源 | N/A | 人工设计 | N/A | **IRL从LLM行为学习** |
-| 知识迁移 | N/A | N/A | N/A | **LLM→IRL→RL三级** |
+| 奖励函数来源 | N/A | 人工设计 | N/A | **文献手工设计 5 维权重（IRL 为实验性对照）** |
+| 知识迁移 | N/A | N/A | N/A | **价值权重 → RL 奖励 → 调度建议** |
 | 未见场景泛化 | 无法 | 需重训练 | **零样本** | **零样本** |
 | 可解释性 | 低 | 极低 | 高(有幻觉) | **高(推理链+约束日志)** |
 | 多角色协同 | 需手动编码 | 需每角色训练 | 仅单一角色 | **5角色+指挥链** |
@@ -454,12 +456,10 @@ RL调度器 (4×MLP):           █ <0.01 GB
 
 **问题**：如何让审稿人相信"LLM + RL"不只是两个技术的简单拼接？
 
-**方案**：引入IRL作为桥梁。LLM不直接控制RL，而是LLM的行为数据→IRL恢复人类价值偏好→RL使用这些价值作为奖励函数。这不是"并行加权"，而是"递进的知识蒸馏"。
-
-**理论贡献**：证明了LLM行为中编码了可区分的价值偏好（5种人设的KL散度最高达0.54），且这些偏好可以直接迁移到RL调度策略中并产生可观测的性能差异。
+**方案（v2.2 修订后）**：价值层采用基于疏散行为文献手工设计的 5 维权重，经敏感性分析验证后注入 RL 奖励；MaxEnt IRL 管线保留为实验性组件，待真实 LLM 轨迹充足后作为对照。训练环境内置采纳率建模（advice_accept_rate），对齐部署时"建议可能被忽略/被护栏拦截"的真实因果链。
 
 **与已有工作的区别**：
-- 不同于Inverse-RL传统用法（从人类示范学控制策略）——本项目是从LLM生成的行为中学
+- 不同于纯物理仿真（SFM/CA）——本项目用 LLM 建模认知层（犹豫/折返/从众），并用安全护栏保证安全关键约束可审计
 - 不同于RLHF（用RL训练LLM对齐人类偏好）——本项目是反过来用LLM教RL什么是好的
 - 不同于LLM+RL并行融合（两个组件独立输出后加权）——本项目是递进的知识迁移
 
@@ -489,23 +489,23 @@ VLM提供语义理解（"左侧有浓烟"），YOLO提供精确数据（"右上�
 
 ### 8.1 论文建议
 
-**标题**：《基于LLM→IRL→RL三级联级的灾害人群疏散多智能体仿真》
+**标题（建议，v2.2 口径）**：《基于LLM认知仿真与价值权重RL调度的灾害人群疏散多智能体系统》
 
-**英文标题**：*From LLM Behavior to Optimal Scheduling: A Three-Tier Cascade Architecture with Inverse Reinforcement Learning for Disaster Crowd Evacuation*
+**英文标题（建议）**：*LLM-Driven Crowd Evacuation Simulation with Value-Weighted Zone-Level RL Scheduling Advice*
 
-**主要贡献声明**：
-1. 提出了LLM→IRL→RL三级联级架构，实现了从人类行为数据到调度策略的知识迁移
-2. 用MaxEnt IRL从12万条LLM决策轨迹中恢复了5种人设的可区分价值权重
-3. 设计了基于IRL权重的分区独立 PPO（Zone-PPO）区域调度器，将学到的价值偏好转化为出口推荐策略
-4. 在真实商场场景(150m×80m, 8出口, 600 Agent)中验证了三级架构的有效性
+**主要贡献声明（诚实版）**：
+1. 多角色 LLM 认知疏散仿真框架（5 角色 + 7 条可审计安全护栏）
+2. 基于文献的 5 维价值权重设计与敏感性分析（附 MaxEnt IRL 实验性对照及其局限性分析）
+3. Zone-PPO 区域调度辅助层，训练环境内置建议采纳率建模以对齐部署因果链
+4. 真实 LLM 仿真下的对照实验设计（固定 seed + 采纳率/护栏修改率指标）
 
 ### 8.2 面试话术（2分钟版）
 
-> "我的毕业设计实现了一个LLM驱��的灾害疏散仿真系统，核心创新是LLM→IRL→RL三级联级架构。第一级用600个LLM Agent生成12万条人类疏散行为数据；第二级用逆强化学习从这些行为中恢复5种人设的价值权重——比如消防员最看重社交利他、老人最看重安全舒适；第三级把这些权重注入多智能体强化学习，训练4个区域调度器，每个调度器用3层MLP实时推理如何把人群最优地分配到8个出口。
+> "我的毕业设计实现了一个LLM驱��的灾害疏散仿真系统，核心定位是 LLM 认知仿真 + 安全护栏 + Zone-PPO 区域调度辅助。认知层用多角色 LLM Agent 模拟人类疏散决策（犹豫/折返/从众），配 7 条可审计的安全护栏作为最终仲裁者；调度层的奖励函数采用基于疏散行为文献手工设计的 5 维价值权重，训练环境内置建议采纳率建模以对齐部署时的真实因果链（MaxEnt IRL 管线作为实验性对照保留）。
 >
-> 工程上，我通过AWQ量化、Prefix Caching和异步流水线把800个Agent的推理从999ms优化到120ms/tick，能在单张4090上跑。还搭了QLoRA微调管线，用安全护栏自动标了76K条训练数据。
+> 工程上，我通过AWQ量化、Prefix Caching和异步流水线把多 Agent 推理压到单张4090可跑的水平，还搭了QLoRA微调管线，用安全护栏自动标注训练数据。
 >
-> 这个项目让我完整走了一遍从数据→IRL→RL→部署→分析的全链路，涵盖了Prompt设计、RAG、微调、部署优化和论文级可视化。"
+> 这个项目让我完整走了一遍从仿真建模→RL训练→部署验证→问题复盘的全链路，涵盖了Prompt设计、RAG、微调、部署优化和论文级可视化。"
 
 ---
 
@@ -523,23 +523,24 @@ python tests/test_physics_only.py
 python main.py --agents 200 --duration 120                    # 本地Pygame渲染
 python main.py --no-viz --record --agents 500                  # 服务器录帧
 
-# 4. 完整LLM → IRL → RL 三级联级实验流程
-# Step 1: 采集LLM行为轨迹 (200轮仿真)
-# 在config/mall_floorplan.yaml中设置 irl.enabled: true
-python main.py --config config/mall_floorplan.yaml --no-viz --agents 200
+# 4. 训练与运行 RL 区域调度（v2.2 路线A 流程）
+# Step 1: 离线训练 Zone-PPO（训练环境内置采纳率建模 advice_accept_rate）
+python main.py --config config/mall_floorplan_rl_extreme.yaml --train-rl \
+  --train-rl-episodes 500 --irl-weights data/irl_weights.json \
+  --rl-output data/rl_policy_v6.json
 
-# Step 2: IRL学习价值权重
-python -m execution.irl_recovery --trajectory_dir data/trajectories --output data/irl_weights.json
-
-# Step 3: 分析IRL权重
+# Step 2: 权重敏感性分析（验证 5 维权重有区分度）
 python -m execution.reward_analysis --weights data/irl_weights.json --output data/analysis/
 
-# Step 4: 初始化RL调度器 + 加载IRL权重
-python -m execution.rl_scheduler --mode init --irl_weights data/irl_weights.json --output data/rl_policy.json
+# Step 3: RL vs 启发式对照实验（固定 seed）
+python -m experiments.compare_rl_heuristic \
+  --rl-config config/mall_floorplan_rl_extreme.yaml \
+  --heuristic-config config/mall_floorplan_extreme.yaml \
+  --agents 200 --duration 360 --seeds 42 43 44 45 46 \
+  --output results/compare_rl_extreme_v6
 
-# Step 5: 运行含RL调度的完整仿真
-# 在config/mall_floorplan.yaml中设置 rl_scheduling.enabled: true
-python main.py --config config/mall_floorplan.yaml --agents 200 --gradio
+# Step 4（实验性）: MaxEnt IRL 对照 —— 仅在真实 LLM 轨迹充足后使用
+# python -m execution.irl_recovery --trajectory_dir data/trajectories --output data/irl_weights_irl.json
 
 # 5. 多模态感知
 python main.py --vlm --vlm-mock --yolo --agents 200             # Mock VLM
@@ -585,8 +586,8 @@ single_gpu_evacuation/
 ├── execution/                       # 执行层 — 物理仿真 + IRL + RL
 │   ├── orchestrator.py              #   主仿真循环 (v2.1: +IRL采集+RL调度)
 │   ├── batched_physics.py           #   批量社会力模型 (Numba JIT)
-│   ├── irl_recovery.py              #   ★ MaxEnt IRL轨迹采集+权重学习 [v2.1]
-│   ├── rl_scheduler.py              #   ★ 分区独立 PPO（Zone-PPO）区域调度+建议注入 [v2.1]
+│   ├── irl_recovery.py              #   MaxEnt IRL实验性管线（部署权重为手工设计，见文件头注释）
+│   ├── rl_scheduler.py              #   ★ 分区独立 PPO（Zone-PPO）区域调度+采纳率建模 [v2.2]
 │   ├── reward_analysis.py           #   ★ IRL权重分析+雷达图+KL散度 [v2.1]
 │   ├── diffusion_policy.py          #   扩散模型轨迹生成 (实验性v2.0)
 │   └── diffusion_trainer.py         #   扩散模型训练脚本

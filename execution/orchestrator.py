@@ -1190,6 +1190,8 @@ class SimulationOrchestrator:
             origin_jitter=float(train_rl_cfg.get("origin_jitter", 15.0)),
             smoke_block_threshold=float(
                 train_rl_cfg.get("smoke_block_threshold", 0.6)),
+            advice_accept_rate=float(
+                train_rl_cfg.get("advice_accept_rate", 0.6)),
         )
 
         print(f"[TrainRL] Simulator: {self.width}×{self.height}m, "
